@@ -9,7 +9,8 @@ from PySide6.QtGui import QAction, QPainter, QPen, QBrush
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QTextEdit, QLineEdit, QFileDialog, QMessageBox, QSplitter,
-    QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsLineItem
+    QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsLineItem,
+    QGraphicsSimpleTextItem
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -204,6 +205,8 @@ class NotesApp(QMainWindow):
         self._render_preview(text)
         self._select_in_list(title)
         self.build_link_graph()
+        self.graph.highlight(title)
+        self.graph.center_on(title)
 
     def _select_in_list(self, title: str):
         # выделяем в списке (если есть)
@@ -305,10 +308,17 @@ class GraphNode(QGraphicsEllipseItem):
     def __init__(self, title: str, x: float, y: float, r: float = 14):
         super().__init__(-r, -r, 2*r, 2*r)
         self.title = title
+        self.r = r
+
         self.setPos(x, y)
         self.setBrush(QBrush())
         self.setPen(QPen())
         self.setFlag(QGraphicsEllipseItem.ItemIsSelectable, True)
+
+        # подпись
+        self.label = QGraphicsSimpleTextItem(title, self)
+        self.label.setPos(r + 6, -8)  # чуть правее центра
+
 
 
 class GraphView(QGraphicsView):
@@ -328,6 +338,40 @@ class GraphView(QGraphicsView):
         # zoom
         factor = 1.15 if event.angleDelta().y() > 0 else (1 / 1.15)
         self.scale(factor, factor)
+
+    def center_on(self, title: str):
+        node = self.nodes.get(title)
+        if node:
+            self.centerOn(node)
+
+    def highlight(self, current_title: str):
+        if not self.nodes:
+            return
+
+        # собрать соседей по ребрам
+        neighbors = set()
+        for a, b in self.edges:
+            if a == current_title:
+                neighbors.add(b)
+            if b == current_title:
+                neighbors.add(a)
+
+        pen_default = QPen()
+        pen_neighbor = QPen()
+        pen_current = QPen()
+
+        # сделаем разную толщину
+        pen_default.setWidth(1)
+        pen_neighbor.setWidth(2)
+        pen_current.setWidth(3)
+
+        for title, node in self.nodes.items():
+            if title == current_title:
+                node.setPen(pen_current)
+            elif title in neighbors:
+                node.setPen(pen_neighbor)
+            else:
+                node.setPen(pen_default)
 
     def mouseDoubleClickEvent(self, event):
         item = self.itemAt(event.position().toPoint())
