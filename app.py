@@ -1,3 +1,12 @@
+import uuid
+SESSION_ID = uuid.uuid4().hex[:8]
+
+class SessionAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        extra = kwargs.setdefault("extra", {})
+        extra["session"] = SESSION_ID
+        return msg, kwargs
+
 import os
 import re
 from pathlib import Path
@@ -11,15 +20,84 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QTextEdit, QLineEdit, QFileDialog, QMessageBox, QSplitter,
     QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsLineItem,
-    QGraphicsSimpleTextItem, QGraphicsItem
+    QGraphicsSimpleTextItem, QGraphicsItem, QDialog
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 import markdown as md
 
+import sys
+import logging
+from logging.handlers import RotatingFileHandler
 
 WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
+APP_NAME = "mini_obsidian"
+LOG_DIR = Path.cwd() / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+LOG_PATH = LOG_DIR / f"{APP_NAME}.log"
+
+
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger(APP_NAME)
+    logger.setLevel(logging.DEBUG)
+
+    if logger.handlers:
+        # чтобы при повторном импорте/запуске не плодить хендлеры
+        return logger
+
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s | sid=%(session)s"
+    )
+
+    # файл с ротацией
+    fh = RotatingFileHandler(
+        LOG_PATH,
+        maxBytes=2 * 1024 * 1024,   # 2MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+
+    # консоль
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+    logger.info("Logging initialized. log_file=%s", LOG_PATH)
+    return logger
+
+
+_base_logger = setup_logging()
+log = SessionAdapter(_base_logger, {})
+
+
+
+def install_global_exception_hooks() -> None:
+    # python exceptions (в основном потоке)
+    def _excepthook(exc_type, exc, tb):
+        log.critical("Uncaught exception", exc_info=(exc_type, exc, tb))
+        # можно оставить дефолтное поведение
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _excepthook
+
+    # Qt warnings/errors (qDebug/qWarning/etc.)
+    try:
+        from PySide6.QtCore import qInstallMessageHandler
+
+        def _qt_message_handler(mode, context, message):
+            # mode -> QtMsgType, но строкой нам достаточно
+            log.warning("Qt: %s", message)
+
+        qInstallMessageHandler(_qt_message_handler)
+        log.info("Qt message handler installed")
+    except Exception:
+        log.exception("Failed to install Qt message handler")
 
 def safe_filename(title: str) -> str:
     # минимальная "санитизация" имени файла
@@ -54,20 +132,105 @@ class LinkableWebView(QWebEngineView):
             # возвращаемся "назад", чтобы не было пустой навигации
             self.back()
 
+class QuickSwitcherDialog(QDialog):
+    def __init__(self, parent, get_titles, on_open):
+        super().__init__(parent)
+        self.setWindowTitle("Quick Switcher")
+        self.setModal(True)
+        self.resize(520, 420)
+
+        self.get_titles = get_titles   # функция -> list[str]
+        self.on_open = on_open         # функция(title)
+
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Введите название… (Enter — открыть/создать)")
+        self.listw = QListWidget()
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.input)
+        layout.addWidget(self.listw)
+
+        self._all = []
+        self._reload()
+
+        self.input.textChanged.connect(self._filter)
+        self.input.returnPressed.connect(self._open_current)
+        self.listw.itemActivated.connect(lambda it: self._open_title(it.text()))
+
+        # UX: сразу фокус в поле ввода
+        self.input.setFocus()
+
+    def _reload(self):
+        self._all = sorted(self.get_titles(), key=str.lower)
+        self._filter(self.input.text())
+
+    def _filter(self, text: str):
+        q = (text or "").strip().lower()
+        self.listw.clear()
+
+        if not q:
+            # когда пусто — показываем первые N (как "recent" упрощенно)
+            for t in self._all[:40]:
+                self.listw.addItem(t)
+            if self.listw.count():
+                self.listw.setCurrentRow(0)
+            return
+
+        # простое fuzzy-ish: сначала contains, потом startswith, потом остальные
+        contains = [t for t in self._all if q in t.lower()]
+        starts = [t for t in contains if t.lower().startswith(q)]
+        rest = [t for t in contains if t not in starts]
+        ranked = starts + rest
+
+        for t in ranked[:80]:
+            self.listw.addItem(t)
+
+        if self.listw.count():
+            self.listw.setCurrentRow(0)
+
+    def _open_current(self):
+        text = self.input.text().strip()
+        if not text:
+            return
+
+        cur = self.listw.currentItem()
+        if cur:
+            self._open_title(cur.text())
+            return
+
+        # если нет совпадений — создаём по введенному
+        self._open_title(text)
+
+    def _open_title(self, title: str):
+        self.on_open(title)
+        self.accept()
 
 class NotesApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        log.info("Приложение инициализировано")
         self.setWindowTitle("Mini-Obsidian (Python)")
 
         self.vault_dir: Path | None = None
         self.current_path: Path | None = None
+
+        # ---- NAV HISTORY ----
+        self._nav_back: list[str] = []
+        self._nav_forward: list[str] = []
+        self._nav_suppress = False  # чтобы back/forward не писали сами себя в историю
+
         self._dirty = False
+        self.graph_mode = "global"   # "global" | "local"
+        self.graph_depth = 1         # 1 или 2
 
         # UI
+
         self.search = QLineEdit()
         self.search.setPlaceholderText("Поиск… (по имени файла)")
         self.listw = QListWidget()
+        self.backlinks = QListWidget()
+        self.backlinks.setMinimumHeight(120)
+        self.backlinks.setToolTip("Backlinks: кто ссылается на текущую заметку")
 
         self.editor = QTextEdit()
         self.preview = LinkableWebView()
@@ -80,6 +243,8 @@ class NotesApp(QMainWindow):
         left_layout.setContentsMargins(8, 8, 8, 8)
         left_layout.addWidget(self.search)
         left_layout.addWidget(self.listw)
+        left_layout.addWidget(self.backlinks)
+        self.backlinks.itemClicked.connect(lambda it: self.open_or_create_by_title(it.text()))
 
         right = QSplitter(Qt.Vertical)
         right.addWidget(self.editor)
@@ -137,6 +302,25 @@ class NotesApp(QMainWindow):
         filem.addSeparator()
         filem.addAction(act_save)
 
+        act_switcher = QAction("Quick Switcher…", self)
+        act_switcher.setShortcut("Ctrl+P")
+        act_switcher.triggered.connect(self.open_quick_switcher)
+        filem.addSeparator()
+        filem.addAction(act_switcher)
+
+        navm = menubar.addMenu("Навигация")
+
+        act_back = QAction("Назад", self)
+        act_back.setShortcut("Alt+Left")
+        act_back.triggered.connect(self.nav_back)
+
+        act_forward = QAction("Вперёд", self)
+        act_forward.setShortcut("Alt+Right")
+        act_forward.triggered.connect(self.nav_forward)
+
+        navm.addAction(act_back)
+        navm.addAction(act_forward)
+
         viewm = menubar.addMenu("Вид")
 
         act_dark = QAction("Тема: Dark", self, checkable=True)
@@ -164,19 +348,94 @@ class NotesApp(QMainWindow):
         viewm.addAction(act_dark)
         viewm.addAction(act_light)
 
+        graphm = menubar.addMenu("Граф")
+
+        act_global = QAction("Global", self, checkable=True)
+        act_local1 = QAction("Local (1 hop)", self, checkable=True)
+        act_local2 = QAction("Local (2 hops)", self, checkable=True)
+        act_global.setChecked(True)
+
+        def _set_mode(mode: str, depth: int = 1):
+            self.graph_mode = mode
+            self.graph_depth = depth
+            act_global.setChecked(mode == "global")
+            act_local1.setChecked(mode == "local" and depth == 1)
+            act_local2.setChecked(mode == "local" and depth == 2)
+
+            self.build_link_graph()
+            if self.current_path:
+                self.graph.highlight(self.current_path.stem)
+
+        act_global.triggered.connect(lambda: _set_mode("global", 1))
+        act_local1.triggered.connect(lambda: _set_mode("local", 1))
+        act_local2.triggered.connect(lambda: _set_mode("local", 2))
+
+        graphm.addAction(act_global)
+        graphm.addAction(act_local1)
+        graphm.addAction(act_local2)
+
+    def open_quick_switcher(self):
+        if self.vault_dir is None:
+            return
+
+        def get_titles():
+            # заметки на диске (без виртуальных)
+            return [p.stem for p in self.vault_dir.glob("*.md")]
+
+        dlg = QuickSwitcherDialog(self, get_titles=get_titles, on_open=self.open_or_create_by_title)
+        dlg.exec()
+
+    def _open_note_no_history(self, title: str):
+        """Открывает/создаёт заметку и обновляет UI, но НЕ трогает историю."""
+        if self.vault_dir is None:
+            return
+
+        title = safe_filename(title)
+        path = self.vault_dir / f"{title}.md"
+        log.info("Открытая заметка (без истории): заголовок=%s путь=%s", title, path)
+
+        # save previous
+        self._save_current_if_needed()
+
+        if not path.exists():
+            log.info("Примечание не существует, создаём: %s", path)
+            path.write_text(f"# {title}\n\n", encoding="utf-8")
+
+        self.current_path = path
+        text = path.read_text(encoding="utf-8")
+
+        self.editor.blockSignals(True)
+        self.editor.setPlainText(text)
+        self.editor.blockSignals(False)
+
+        self._dirty = False
+        self._render_preview(text)
+        self._select_in_list(title)
+
+        self.build_link_graph()
+        self.graph.highlight(title)
+        self.graph.center_on(title)
+        self.refresh_backlinks()
+
     def choose_vault(self):
+        log.info("Открылось диалоговое окно «Выбрать хранилище».")
         path = QFileDialog.getExistingDirectory(self, "Выберите папку для заметок")
+
         if not path:
             # если пользователь отменил и vault ещё не выбран — создадим временную папку рядом
             if self.vault_dir is None:
                 tmp = Path.cwd() / "vault"
                 tmp.mkdir(exist_ok=True)
                 self.vault_dir = tmp
+                log.warning("Хранилище не выбрано. Используется резервное хранилище=%s", tmp)
                 self.refresh_list()
+            else:
+                log.info("Выбор хранилища отменён. Сохраняется хранилище=%s", self.vault_dir)
             return
 
         self.vault_dir = Path(path)
         self.vault_dir.mkdir(parents=True, exist_ok=True)
+        log.info("Vault selected: %s", self.vault_dir)
         self.current_path = None
         self.editor.blockSignals(True)
         self.editor.clear()
@@ -214,27 +473,53 @@ class NotesApp(QMainWindow):
             return
 
         title = safe_filename(title)
-        path = self.vault_dir / f"{title}.md"
+        log.debug("open_or_create_by_title: заголовок=%s подавлять=%s", title, self._nav_suppress)
 
-        # save previous
-        self._save_current_if_needed()
+        # если это обычная навигация (не back/forward) — пишем историю
+        if not self._nav_suppress:
+            current = self.current_path.stem if self.current_path else None
+            if current and current != title:
+                self._nav_back.append(current)
+                self._nav_forward.clear()
 
-        if not path.exists():
-            path.write_text(f"# {title}\n\n", encoding="utf-8")
+        self._open_note_no_history(title)
 
-        self.current_path = path
-        text = path.read_text(encoding="utf-8")
+    def nav_back(self):
+        if not self._nav_back:
+            return
+        
+        log.debug("Навигация назад: стек=%s", self._nav_back)
 
-        self.editor.blockSignals(True)
-        self.editor.setPlainText(text)
-        self.editor.blockSignals(False)
+        current = self.current_path.stem if self.current_path else None
+        if current:
+            self._nav_forward.append(current)
 
-        self._dirty = False
-        self._render_preview(text)
-        self._select_in_list(title)
-        self.build_link_graph()
-        self.graph.highlight(title)
-        self.graph.center_on(title)
+        title = self._nav_back.pop()
+
+        self._nav_suppress = True
+        try:
+            self._open_note_no_history(title)
+        finally:
+            self._nav_suppress = False
+
+    def nav_forward(self):
+        if not self._nav_forward:
+            return
+        
+        log.debug("Навигация вперёд: стек=%s", self._nav_forward)
+
+        current = self.current_path.stem if self.current_path else None
+        if current:
+            self._nav_back.append(current)
+
+        title = self._nav_forward.pop()
+
+        self._nav_suppress = True
+        try:
+            self._open_note_no_history(title)
+        finally:
+            self._nav_suppress = False
+
 
     def _select_in_list(self, title: str):
         # выделяем в списке (если есть)
@@ -283,12 +568,17 @@ class NotesApp(QMainWindow):
     def _save_current_if_needed(self):
         if not self._dirty or self.current_path is None:
             return
+        
+        log.info("Сохранение заметки: %s", self.current_path)
+
         try:
             self.current_path.write_text(self.editor.toPlainText(), encoding="utf-8")
             self._dirty = False
             self.refresh_list()
             self.build_link_graph()
+            self.refresh_backlinks()
         except Exception as e:
+            log.exception("Сохранить не удалось: %s", self.current_path)
             QMessageBox.critical(self, "Ошибка сохранения", str(e))
 
     def create_note_dialog(self):
@@ -302,14 +592,14 @@ class NotesApp(QMainWindow):
     def build_link_graph(self):
         if self.vault_dir is None:
             return
+        
+        t0 = time.perf_counter()
 
-        # 1) читаем все заметки
         files = list(self.vault_dir.glob("*.md"))
-        titles = [p.stem for p in files]
-        title_set = set(titles)
+        title_set = {p.stem for p in files}
 
-        edges: list[tuple[str, str]] = []
-
+        # соберём все ребра + список виртуальных узлов
+        edges_all: list[tuple[str, str]] = []
         for p in files:
             src = p.stem
             try:
@@ -319,17 +609,84 @@ class NotesApp(QMainWindow):
 
             for m in WIKILINK_RE.finditer(text):
                 dst = safe_filename(m.group(1).strip())
-                # Obsidian создает "виртуальные" узлы тоже — сделаем так же:
                 if dst not in title_set:
-                    titles.append(dst)
-                    title_set.add(dst)
+                    title_set.add(dst)  # виртуальный узел
                 if src != dst:
-                    edges.append((src, dst))
+                    edges_all.append((src, dst))
 
-        # уберем дубликаты ребер
-        edges = list(dict.fromkeys(edges))
+        # уберем дубликаты
+        edges_all = list(dict.fromkeys(edges_all))
+        nodes_all = sorted(title_set, key=str.lower)
 
-        self.graph.build(sorted(title_set, key=str.lower), edges)
+        # --- LOCAL GRAPH ---
+        if self.graph_mode == "local" and self.current_path is not None:
+            center = self.current_path.stem
+            # строим adjacency
+            adj: dict[str, set[str]] = {n: set() for n in nodes_all}
+            for a, b in edges_all:
+                if a in adj:
+                    adj[a].add(b)
+                if b in adj:
+                    adj[b].add(a)
+
+            # BFS на depth hops
+            depth = max(1, int(self.graph_depth))
+            visited = {center}
+            frontier = {center}
+            for _ in range(depth):
+                nxt = set()
+                for v in frontier:
+                    nxt |= adj.get(v, set())
+                nxt -= visited
+                visited |= nxt
+                frontier = nxt
+
+            nodes = sorted(visited, key=str.lower)
+            node_set = set(nodes)
+            edges = [(a, b) for (a, b) in edges_all if a in node_set and b in node_set]
+
+            self.graph.build(nodes, edges)
+
+            dt = (time.perf_counter() - t0) * 1000.0
+            log.debug("График построен: режим=%s глубина=%s узлы=%d края=%d time_ms=%.1f",
+                self.graph_mode, self.graph_depth, len(nodes_all), len(edges_all), dt)
+            
+            return
+
+        # --- GLOBAL GRAPH ---
+        self.graph.build(nodes_all, edges_all)
+
+    def refresh_backlinks(self):
+        self.backlinks.clear()
+        if self.vault_dir is None or self.current_path is None:
+            return
+
+        target = self.current_path.stem
+        files = list(self.vault_dir.glob("*.md"))
+
+        refs = []
+        for p in files:
+            src = p.stem
+            if src == target:
+                continue
+            try:
+                text = p.read_text(encoding="utf-8")
+            except Exception as e:
+                log.warning("Не удалось прочитать файл %s: %s", p, e)
+                continue
+
+            # ищем [[target]] (с учетом safe_filename)
+            for m in WIKILINK_RE.finditer(text):
+                dst = safe_filename(m.group(1).strip())
+                if dst == target:
+                    refs.append(src)
+                    break
+
+        # unique + sort
+        refs = sorted(set(refs), key=str.lower)
+        log.debug("Обратные ссылки обновлены: цель=%s считать=%d", target, len(refs))
+        for r in refs:
+            self.backlinks.addItem(r)
 
 class GraphNode(QGraphicsEllipseItem):
     def __init__(self, title: str, x: float, y: float, degree: int, theme: dict, r_base: float = 10.0):
@@ -369,6 +726,8 @@ class GraphNode(QGraphicsEllipseItem):
         self.label = QGraphicsSimpleTextItem(title, self)
         self.label.setBrush(QBrush(theme["label"]))
         self.label.setPos(r + 6, -8)
+        self.label.setOpacity(1.0)
+
 
     def hoverEnterEvent(self, event):
         self.setPen(self.pen_hover)
@@ -447,6 +806,15 @@ class GraphView(QGraphicsView):
         self._anim_start: dict[str, QPointF] = {}
         self._anim_target: dict[str, QPointF] = {}
 
+        # ---- LABEL LOD (fade in/out by zoom) ----
+        self._lod_timer = QTimer(self)
+        self._lod_timer.setInterval(16)  # ~60 FPS
+        self._lod_timer.timeout.connect(self._on_lod_tick)
+
+        self._lod_current = 1.0
+        self._lod_target = 1.0
+
+
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else (1 / 1.15)
 
@@ -457,6 +825,7 @@ class GraphView(QGraphicsView):
             return
 
         self.scale(factor, factor)
+        self._set_lod_target()
 
     def animate_to(self, target_pos: dict[str, QPointF]):
         # если уже идет анимация — остановим, чтобы не накапливать
@@ -513,6 +882,10 @@ class GraphView(QGraphicsView):
                     line.setLine(p1.x(), p1.y(), p2.x(), p2.y())
 
             self._anim_timer.stop()
+
+        # во время анимации тоже поддерживаем LOD (если пользователь зумит)
+        self._set_lod_target()
+
 
     def center_on(self, title: str):
         node = self.nodes.get(title)
@@ -612,6 +985,7 @@ class GraphView(QGraphicsView):
 
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-120, -120, 120, 120))
         self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        self._set_lod_target()
         self.animate_to(target_pos)
 
     def _layout_force(self, nodes, edges, pos, steps=200):
@@ -687,11 +1061,47 @@ class GraphView(QGraphicsView):
         # сохраняем, чтобы Node мог их взять
         self._t = t
 
+    def _lod_target_from_scale(self, s: float) -> float:
+        # s = текущий масштаб (1.0 примерно "нормально")
+        # < 0.55  -> 0 (скрыть)
+        # 0.55..1 -> плавно 0..1
+        # > 1     -> 1 (показать)
+        if s <= 0.55:
+            return 0.0
+        if s >= 1.0:
+            return 1.0
+        return (s - 0.55) / (1.0 - 0.55)
+
+    def _set_lod_target(self):
+        s = float(self.transform().m11())
+        self._lod_target = self._lod_target_from_scale(s)
+        if not self._lod_timer.isActive():
+            self._lod_timer.start()
+
+    def _on_lod_tick(self):
+        # экспоненциальное приближение к цели (мягко, без рывков)
+        # чем больше alpha — тем быстрее
+        alpha = 0.18
+        self._lod_current = self._lod_current * (1.0 - alpha) + self._lod_target * alpha
+
+        # применяем к label у всех нод
+        for node in self.nodes.values():
+            node.label.setOpacity(self._lod_current)
+
+        # стоп, когда почти достигли цели
+        if abs(self._lod_current - self._lod_target) < 0.02:
+            self._lod_current = self._lod_target
+            for node in self.nodes.values():
+                node.label.setOpacity(self._lod_current)
+            self._lod_timer.stop()
+
 def main():
+    install_global_exception_hooks()
     app = QApplication([])
     win = NotesApp()
     win.resize(1100, 700)
     win.show()
+    log.info("Приложение запущено, SID=%s", SESSION_ID)
     app.exec()
 
 
