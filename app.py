@@ -3,14 +3,15 @@ import re
 from pathlib import Path
 import math
 import random
+import time
 
-from PySide6.QtCore import Qt, QTimer, Signal, QPointF
-from PySide6.QtGui import QAction, QPainter, QPen, QBrush
+from PySide6.QtCore import Qt, QTimer, Signal, QPointF, QElapsedTimer
+from PySide6.QtGui import QAction, QPainter, QPen, QBrush, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QTextEdit, QLineEdit, QFileDialog, QMessageBox, QSplitter,
     QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsLineItem,
-    QGraphicsSimpleTextItem
+    QGraphicsSimpleTextItem, QGraphicsItem
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -135,6 +136,33 @@ class NotesApp(QMainWindow):
         filem.addAction(act_new)
         filem.addSeparator()
         filem.addAction(act_save)
+
+        viewm = menubar.addMenu("Вид")
+
+        act_dark = QAction("Тема: Dark", self, checkable=True)
+        act_light = QAction("Тема: Light", self, checkable=True)
+        act_dark.setChecked(True)
+
+        def set_dark():
+            act_dark.setChecked(True); act_light.setChecked(False)
+            self.graph.apply_theme("dark")
+            # перестроим граф, чтобы ноды пересоздались с новой темой
+            self.build_link_graph()
+            if self.current_path:
+                self.graph.highlight(self.current_path.stem)
+
+        def set_light():
+            act_light.setChecked(True); act_dark.setChecked(False)
+            self.graph.apply_theme("light")
+            self.build_link_graph()
+            if self.current_path:
+                self.graph.highlight(self.current_path.stem)
+
+        act_dark.triggered.connect(set_dark)
+        act_light.triggered.connect(set_light)
+
+        viewm.addAction(act_dark)
+        viewm.addAction(act_light)
 
     def choose_vault(self):
         path = QFileDialog.getExistingDirectory(self, "Выберите папку для заметок")
@@ -303,22 +331,63 @@ class NotesApp(QMainWindow):
 
         self.graph.build(sorted(title_set, key=str.lower), edges)
 
-
 class GraphNode(QGraphicsEllipseItem):
-    def __init__(self, title: str, x: float, y: float, r: float = 14):
+    def __init__(self, title: str, x: float, y: float, degree: int, theme: dict, r_base: float = 10.0):
+        r = r_base + min(10.0, degree * 1.6)
+
         super().__init__(-r, -r, 2*r, 2*r)
         self.title = title
         self.r = r
+        self.degree = degree
+        self._theme = theme
 
         self.setPos(x, y)
-        self.setBrush(QBrush())
-        self.setPen(QPen())
+        self.setAcceptHoverEvents(True)
         self.setFlag(QGraphicsEllipseItem.ItemIsSelectable, True)
 
-        # подпись
-        self.label = QGraphicsSimpleTextItem(title, self)
-        self.label.setPos(r + 6, -8)  # чуть правее центра
+        # --- glow ring (простое "свечение") ---
+        glow_r = r + 10
+        self.glow = QGraphicsEllipseItem(-glow_r, -glow_r, 2*glow_r, 2*glow_r, self)
+        self.glow.setPen(QPen(Qt.NoPen))
+        self.glow.setBrush(QBrush(theme["glow"]))
+        self.glow.setZValue(-1)     # под основным кругом
+        self.glow.setVisible(False) # показываем на hover/selected
 
+        # pens/brushes from theme
+        self.pen_default = QPen(theme["node_pen"]); self.pen_default.setWidth(1)
+        self.pen_hover = QPen(theme["node_pen_hover"]); self.pen_hover.setWidth(2)
+        self.pen_selected = QPen(theme["node_pen_selected"]); self.pen_selected.setWidth(3)
+
+        self.brush_default = QBrush(theme["node_fill"])
+        self.brush_hover = QBrush(theme["node_fill_hover"])
+        self.brush_selected = QBrush(theme["node_fill_selected"])
+
+        self.setPen(self.pen_default)
+        self.setBrush(self.brush_default)
+
+        # label
+        self.label = QGraphicsSimpleTextItem(title, self)
+        self.label.setBrush(QBrush(theme["label"]))
+        self.label.setPos(r + 6, -8)
+
+    def hoverEnterEvent(self, event):
+        self.setPen(self.pen_hover)
+        self.setBrush(self.brush_hover)
+        self.setScale(1.15)
+        self.glow.setVisible(True)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        if self.isSelected():
+            self.setPen(self.pen_selected)
+            self.setBrush(self.brush_selected)
+            self.glow.setVisible(True)
+        else:
+            self.setPen(self.pen_default)
+            self.setBrush(self.brush_default)
+            self.glow.setVisible(False)
+        self.setScale(1.0)
+        super().hoverLeaveEvent(event)
 
 
 class GraphView(QGraphicsView):
@@ -330,14 +399,120 @@ class GraphView(QGraphicsView):
         self.setScene(self.scene)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.edge_items: dict[tuple[str, str], QGraphicsLineItem] = {}
 
         self.nodes: dict[str, GraphNode] = {}
         self.edges: list[tuple[str, str]] = []
 
+        # ---- THEMES ----
+        self._themes = {
+            "dark": {
+                "bg": QColor(18, 18, 20),
+                "edge": QColor(180, 180, 190, 60),
+                "edge_hi": QColor(255, 255, 255, 140),
+                "node_fill": QColor(80, 80, 90, 180),
+                "node_fill_hover": QColor(120, 120, 130, 220),
+                "node_fill_selected": QColor(170, 170, 180, 240),
+                "node_pen": QColor(140, 140, 150, 180),
+                "node_pen_hover": QColor(240, 240, 240, 230),
+                "node_pen_selected": QColor(255, 255, 255, 255),
+                "label": QColor(235, 235, 240, 220),
+                "glow": QColor(255, 255, 255, 40),
+            },
+            "light": {
+                "bg": QColor(245, 245, 248),
+                "edge": QColor(60, 60, 70, 50),
+                "edge_hi": QColor(40, 40, 50, 150),
+                "node_fill": QColor(235, 235, 240, 255),
+                "node_fill_hover": QColor(220, 220, 230, 255),
+                "node_fill_selected": QColor(200, 200, 215, 255),
+                "node_pen": QColor(80, 80, 90, 160),
+                "node_pen_hover": QColor(20, 20, 30, 220),
+                "node_pen_selected": QColor(10, 10, 20, 255),
+                "label": QColor(20, 20, 30, 220),
+                "glow": QColor(0, 0, 0, 25),
+            },
+        }
+        self._theme_name = "dark"
+        self.apply_theme(self._theme_name)
+
+        # ---- ANIMATION ----
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(16)  # ~60 FPS
+        self._anim_timer.timeout.connect(self._on_anim_tick)
+
+        self._anim_clock = QElapsedTimer()
+        self._anim_duration_ms = 380  # скорость анимации
+
+        self._anim_start: dict[str, QPointF] = {}
+        self._anim_target: dict[str, QPointF] = {}
+
     def wheelEvent(self, event):
-        # zoom
         factor = 1.15 if event.angleDelta().y() > 0 else (1 / 1.15)
+
+        # лимитируем масштаб
+        current = self.transform().m11()
+        new_scale = current * factor
+        if new_scale < 0.2 or new_scale > 5.0:
+            return
+
         self.scale(factor, factor)
+
+    def animate_to(self, target_pos: dict[str, QPointF]):
+        # если уже идет анимация — остановим, чтобы не накапливать
+        if self._anim_timer.isActive():
+            self._anim_timer.stop()
+
+        self._anim_target = dict(target_pos)
+        self._anim_start = {t: self.nodes[t].pos() for t in self.nodes.keys() if t in self._anim_target}
+
+        self._anim_clock.restart()
+        self._anim_timer.start()
+
+    def _ease_out_cubic(self, t: float) -> float:
+        # t in [0..1]
+        return 1.0 - (1.0 - t) ** 3
+
+    def _on_anim_tick(self):
+        elapsed = self._anim_clock.elapsed()
+        t = min(1.0, elapsed / self._anim_duration_ms)
+        k = self._ease_out_cubic(t)
+
+        # двигаем узлы
+        for title, node in self.nodes.items():
+            if title not in self._anim_target:
+                continue
+            p0 = self._anim_start.get(title, node.pos())
+            p1 = self._anim_target[title]
+            x = p0.x() * (1.0 - k) + p1.x() * k
+            y = p0.y() * (1.0 - k) + p1.y() * k
+            node.setPos(x, y)
+
+        # обновляем рёбра так, чтобы они тянулись за узлами
+        for (a, b), line in self.edge_items.items():
+            na = self.nodes.get(a)
+            nb = self.nodes.get(b)
+            if not na or not nb:
+                continue
+            p1 = na.pos()
+            p2 = nb.pos()
+            line.setLine(p1.x(), p1.y(), p2.x(), p2.y())
+
+        if t >= 1.0:
+            # финальный snap в точные координаты
+            for title, node in self.nodes.items():
+                if title in self._anim_target:
+                    node.setPos(self._anim_target[title])
+
+            for (a, b), line in self.edge_items.items():
+                na = self.nodes.get(a)
+                nb = self.nodes.get(b)
+                if na and nb:
+                    p1 = na.pos()
+                    p2 = nb.pos()
+                    line.setLine(p1.x(), p1.y(), p2.x(), p2.y())
+
+            self._anim_timer.stop()
 
     def center_on(self, title: str):
         node = self.nodes.get(title)
@@ -348,7 +523,6 @@ class GraphView(QGraphicsView):
         if not self.nodes:
             return
 
-        # собрать соседей по ребрам
         neighbors = set()
         for a, b in self.edges:
             if a == current_title:
@@ -356,61 +530,89 @@ class GraphView(QGraphicsView):
             if b == current_title:
                 neighbors.add(a)
 
-        pen_default = QPen()
-        pen_neighbor = QPen()
-        pen_current = QPen()
+        # сброс ребер
+        pen_edge = self._pen_edge
+        pen_edge.setWidth(1)
+        for line in self.edge_items.values():
+            line.setPen(pen_edge)
 
-        # сделаем разную толщину
-        pen_default.setWidth(1)
-        pen_neighbor.setWidth(2)
-        pen_current.setWidth(3)
+        # подсветка ребер от текущего к соседям
+        pen_edge_hi = self._pen_edge_hi
+        pen_edge_hi.setWidth(2)
+        for nb in neighbors:
+            line = self.edge_items.get((current_title, nb)) or self.edge_items.get((nb, current_title))
+            if line:
+                line.setPen(pen_edge_hi)
 
+        # узлы
         for title, node in self.nodes.items():
+            node.setSelected(False)  # чтобы hover/leave корректно возвращал стиль
             if title == current_title:
-                node.setPen(pen_current)
+                node.setPen(node.pen_selected)
+                node.setBrush(node.brush_selected)
+                node.glow.setVisible(True)
             elif title in neighbors:
-                node.setPen(pen_neighbor)
+                node.setPen(node.pen_hover)
+                node.setBrush(node.brush_hover)
+                node.glow.setVisible(False)
             else:
-                node.setPen(pen_default)
+                node.setPen(node.pen_default)
+                node.setBrush(node.brush_default)
+                node.glow.setVisible(False)
 
-    def mouseDoubleClickEvent(self, event):
+    def mousePressEvent(self, event):
         item = self.itemAt(event.position().toPoint())
-        if isinstance(item, GraphNode):
+        if isinstance(item, GraphNode) and event.button() == Qt.LeftButton:
             self.on_open_note(item.title)
             return
-        super().mouseDoubleClickEvent(event)
+        super().mousePressEvent(event)
 
     def build(self, nodes: list[str], edges: list[tuple[str, str]]):
+        prev_pos = {t: node.pos() for t, node in self.nodes.items()}
         self.scene.clear()
         self.nodes.clear()
         self.edges = edges[:]
+        self.edge_items.clear()
 
-        # стартовые координаты
+        # степень узлов
+        deg = {n: 0 for n in nodes}
+        for a, b in edges:
+            if a in deg: deg[a] += 1
+            if b in deg: deg[b] += 1
+
         rng = random.Random(42)
         pos = {n: QPointF(rng.uniform(-250, 250), rng.uniform(-250, 250)) for n in nodes}
+        target_pos = self._layout_force(nodes, edges, pos, steps=250)
 
-        # force-directed layout (простая, но работает)
-        pos = self._layout_force(nodes, edges, pos, steps=250)
+        # ребра (полупрозрачные)
+        pen_edge = self._pen_edge
 
-        # рисуем ребра (сначала линии)
-        pen = QPen()
-        for a, b in edges:
-            if a not in pos or b not in pos:
-                continue
-            p1, p2 = pos[a], pos[b]
-            line = QGraphicsLineItem(p1.x(), p1.y(), p2.x(), p2.y())
-            line.setPen(pen)
-            self.scene.addItem(line)
-
-        # рисуем узлы
+        # узлы (создаем на "старых" позициях, если узел существовал)
         for n in nodes:
-            p = pos[n]
-            node = GraphNode(n, p.x(), p.y(), r=14)
+            tp = target_pos[n]
+            sp = prev_pos.get(n, tp)  # старт = старая позиция, если есть
+
+            node = GraphNode(n, sp.x(), sp.y(), degree=deg.get(n, 0), theme=self._t, r_base=10.0)
+            node.setZValue(10)
             self.scene.addItem(node)
             self.nodes[n] = node
 
-        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-80, -80, 80, 80))
+        for a, b in edges:
+            na = self.nodes.get(a)
+            nb = self.nodes.get(b)
+            if not na or not nb:
+                continue
+            p1, p2 = na.pos(), nb.pos()
+            line = QGraphicsLineItem(p1.x(), p1.y(), p2.x(), p2.y())
+            line.setPen(pen_edge)
+            line.setZValue(-10)
+            self.scene.addItem(line)
+
+            self.edge_items[(a, b)] = line
+
+        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-120, -120, 120, 120))
         self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        self.animate_to(target_pos)
 
     def _layout_force(self, nodes, edges, pos, steps=200):
         # параметры (подкрутишь по вкусу)
@@ -466,6 +668,24 @@ class GraphView(QGraphicsView):
 
         return pos
 
+    def apply_theme(self, name: str):
+        if name not in self._themes:
+            return
+        self._theme_name = name
+        t = self._themes[name]
+
+        # фон
+        self.setBackgroundBrush(QBrush(t["bg"]))
+
+        # перо ребер по умолчанию (используется в build/highlight)
+        self._pen_edge = QPen(t["edge"])
+        self._pen_edge.setWidth(1)
+
+        self._pen_edge_hi = QPen(t["edge_hi"])
+        self._pen_edge_hi.setWidth(2)
+
+        # сохраняем, чтобы Node мог их взять
+        self._t = t
 
 def main():
     app = QApplication([])
