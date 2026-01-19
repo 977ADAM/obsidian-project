@@ -1,18 +1,28 @@
-import uuid
-SESSION_ID = uuid.uuid4().hex[:8]
-
-class SessionAdapter(logging.LoggerAdapter):
-    def process(self, msg, kwargs):
-        extra = kwargs.setdefault("extra", {})
-        extra["session"] = SESSION_ID
-        return msg, kwargs
-
 import os
 import re
+import sys
+import uuid
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import math
 import random
 import time
+
+SESSION_ID = uuid.uuid4().hex[:8]
+
+class EnsureSessionFilter(logging.Filter):
+    """Гарантирует наличие record.session, чтобы Formatter не падал."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "session"):
+            record.session = SESSION_ID
+        return True
+
+class SessionAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        extra = kwargs.setdefault("extra", {})
+        extra.setdefault("session", SESSION_ID)
+        return msg, kwargs
 
 from PySide6.QtCore import Qt, QTimer, Signal, QPointF, QElapsedTimer
 from PySide6.QtGui import QAction, QPainter, QPen, QBrush, QColor
@@ -26,21 +36,19 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 
 import markdown as md
 
-import sys
-import logging
-from logging.handlers import RotatingFileHandler
-
 WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
 APP_NAME = "mini_obsidian"
-LOG_DIR = Path.cwd() / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-LOG_PATH = LOG_DIR / f"{APP_NAME}.log"
 
+# Путь логов лучше не в cwd: он нестабилен для GUI приложений.
+LOG_DIR = Path.home() / f".{APP_NAME}" / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_PATH = LOG_DIR / f"{APP_NAME}.log"
 
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger(APP_NAME)
     logger.setLevel(logging.DEBUG)
+    logger.propagate = False
 
     if logger.handlers:
         # чтобы при повторном импорте/запуске не плодить хендлеры
@@ -49,6 +57,7 @@ def setup_logging() -> logging.Logger:
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s | sid=%(session)s"
     )
+    session_filter = EnsureSessionFilter()
 
     # файл с ротацией
     fh = RotatingFileHandler(
@@ -59,11 +68,13 @@ def setup_logging() -> logging.Logger:
     )
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
+    fh.addFilter(session_filter)
 
     # консоль
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
+    ch.addFilter(session_filter)
 
     logger.addHandler(fh)
     logger.addHandler(ch)
@@ -71,11 +82,8 @@ def setup_logging() -> logging.Logger:
     logger.info("Logging initialized. log_file=%s", LOG_PATH)
     return logger
 
-
 _base_logger = setup_logging()
 log = SessionAdapter(_base_logger, {})
-
-
 
 def install_global_exception_hooks() -> None:
     # python exceptions (в основном потоке)
@@ -91,8 +99,34 @@ def install_global_exception_hooks() -> None:
         from PySide6.QtCore import qInstallMessageHandler
 
         def _qt_message_handler(mode, context, message):
-            # mode -> QtMsgType, но строкой нам достаточно
-            log.warning("Qt: %s", message)
+            # Поднимем полезный контекст: файл/строка/функция.
+            try:
+                file = getattr(context, "file", None)
+                line = getattr(context, "line", None)
+                func = getattr(context, "function", None)
+                where = f"{file}:{line} {func}" if file or line or func else "unknown"
+            except Exception:
+                where = "unknown"
+
+            # Примерная мапа уровней (не идеальна, но лучше чем всегда warning)
+            # QtMsgType: 0=Debug, 1=Warning, 2=Critical, 3=Fatal, 4=Info (зависит от Qt)
+            level = logging.WARNING
+            try:
+                m = int(mode)
+                if m == 0:
+                    level = logging.DEBUG
+                elif m == 4:
+                    level = logging.INFO
+                elif m == 2:
+                    level = logging.ERROR
+                elif m == 3:
+                    level = logging.CRITICAL
+                else:
+                    level = logging.WARNING
+            except Exception:
+                level = logging.WARNING
+
+            log.log(level, "Qt: %s | where=%s", message, where)
 
         qInstallMessageHandler(_qt_message_handler)
         log.info("Qt message handler installed")
@@ -600,11 +634,13 @@ class NotesApp(QMainWindow):
 
         # соберём все ребра + список виртуальных узлов
         edges_all: list[tuple[str, str]] = []
+
         for p in files:
             src = p.stem
             try:
                 text = p.read_text(encoding="utf-8")
             except Exception:
+                log.warning("Не удалось прочитать файл для графа: %s", p, exc_info=True)
                 continue
 
             for m in WIKILINK_RE.finditer(text):
@@ -655,6 +691,10 @@ class NotesApp(QMainWindow):
 
         # --- GLOBAL GRAPH ---
         self.graph.build(nodes_all, edges_all)
+
+        dt = (time.perf_counter() - t0) * 1000.0
+        log.debug("Граф построен: режим=%s глубина=%s узлы=%d края=%d time_ms=%.1f",
+            self.graph_mode, self.graph_depth, len(nodes_all), len(edges_all), dt)
 
     def refresh_backlinks(self):
         self.backlinks.clear()
