@@ -1,3 +1,5 @@
+APP_NAME = "obsidian-project"
+
 import os
 import re
 import sys
@@ -46,6 +48,9 @@ try:
 except Exception:  # pragma: no cover
     bleach = None
 
+# чтобы не спамить warning при отсутствии bleach
+_BLEACH_MISSING_WARNED = False
+
 WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
 ALLOWED_TAGS = [
@@ -72,14 +77,15 @@ def sanitize_rendered_html(rendered_html: str) -> str:
     Without this, raw HTML inside notes can execute in the embedded browser.
     """
     if bleach is None:
-        # Fallback: safest is to escape everything (no formatting),
-        # but that kills Markdown rendering. Instead, warn once and pass-through.
-        # Consider making bleach a hard dependency for release builds.
-        logging.getLogger("mini_obsidian").warning(
-            "bleach is not installed; Markdown HTML is not sanitized. "
-            "Install 'bleach' to prevent HTML/JS injection in preview."
-        )
-        return rendered_html
+        # SAFE fallback: escape everything (loses formatting but prevents HTML/JS execution).
+        global _BLEACH_MISSING_WARNED
+        if not _BLEACH_MISSING_WARNED:
+            logging.getLogger(APP_NAME).warning(
+                "bleach is not installed; preview will be shown as plain text for safety. "
+                "Install 'bleach' to enable sanitized HTML rendering."
+            )
+            _BLEACH_MISSING_WARNED = True
+        return html.escape(rendered_html)
 
     cleaned = bleach.clean(
         rendered_html,
@@ -90,8 +96,6 @@ def sanitize_rendered_html(rendered_html: str) -> str:
     )
     # Also strip out any JS-able URLs that might slip through.
     return cleaned
-
-APP_NAME = "obsidian-project"
 
 # Путь логов лучше не в cwd: он нестабилен для GUI приложений.
 LOG_DIR = Path.home() / f".{APP_NAME}" / "logs"
@@ -242,17 +246,42 @@ def safe_filename(title: str) -> str:
 
 def wikilinks_to_html(markdown_text: str) -> str:
     """
-    Заменяем [[Note]] на <a href="note://...">...</a>
+    Заменяем wikilinks на <a href="note://...">...</a>
+
+    Поддерживаем alias (Obsidian-style):
+        - [[target]] -> label=target, href=note://safe_filename(target)
+        - [[target|display]] -> label=display, href=note://safe_filename(target)
+
     Важно:
-      - label HTML-экранируем (защита от инъекций)
-      - href URL-энкодим (пробелы/юникод/спецсимволы)
+        - label HTML-экранируем (защита от инъекций)
+        - href URL-энкодим (пробелы/юникод/спецсимволы)
+        - href всегда строим по каноническому имени файла (safe_filename),
+        чтобы переходы/граф/беклинки совпадали с тем, как заметки реально
+        сохраняются на диске.
     """
     def repl(m: re.Match) -> str:
-        raw = (m.group(1) or "").strip()
-        # label: показываем как есть, но безопасно для HTML
-        label = html.escape(raw, quote=False)
-        # href: URL encoding, чтобы не ломать атрибут и схему
-        href = "note://" + quote(raw, safe="")
+        inner = (m.group(1) or "").strip()
+        if not inner:
+            return ""
+
+        # Alias: [[target|display]]
+        # Если '|' нет — display=target.
+        if "|" in inner:
+            target_raw, display_raw = inner.split("|", 1)
+            target_raw = target_raw.strip()
+            display_raw = display_raw.strip()
+        else:
+            target_raw = inner
+            display_raw = inner
+
+        # label: показываем display, но безопасно для HTML
+        label = html.escape(display_raw, quote=False)
+
+        # href: КАНОН - имя файла строим из target
+        target = safe_filename(target_raw)
+
+        # URL encoding, чтобы не ломать атрибут и схему
+        href = "note://" + quote(target, safe="")
         return f'<a href="{href}">{label}</a>'
 
     return WIKILINK_RE.sub(repl, markdown_text)
@@ -426,6 +455,12 @@ class NotesApp(QMainWindow):
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self._save_current_if_needed)
 
+        # Preview debounce (чтобы не рендерить markdown на каждый символ)
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setInterval(200)  # мс
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.timeout.connect(self._render_preview_from_editor)
+
         # Signals
         self.search.textChanged.connect(self.refresh_list)
         self.listw.itemSelectionChanged.connect(self._on_select_note)
@@ -548,6 +583,13 @@ class NotesApp(QMainWindow):
         title = safe_filename(title)
         path = self.vault_dir / f"{title}.md"
         log.info("Открытая заметка (без истории): заголовок=%s путь=%s", title, path)
+
+        # --- FIX: остановим отложенные сохранение/превью от предыдущей заметки ---
+        # Иначе таймер мог "стрельнуть" после смены current_path и сохранить/отрендерить не то.
+        if self.save_timer.isActive():
+            self.save_timer.stop()
+        if self.preview_timer.isActive():
+            self.preview_timer.stop()
 
         # save previous
         self._save_current_if_needed()
@@ -691,9 +733,13 @@ class NotesApp(QMainWindow):
 
     def _on_text_changed(self):
         self._dirty = True
-        text = self.editor.toPlainText()
-        self._render_preview(text)
+        # Не рендерим превью на каждый символ — дебаунсим.
+        self.preview_timer.start()
         self.save_timer.start()
+
+    def _render_preview_from_editor(self):
+        """Рендер превью из текущего текста редактора (используется таймером)."""
+        self._render_preview(self.editor.toPlainText())
 
     def _render_preview(self, text: str):
         # wiki links -> html links, потом markdown -> html
@@ -769,7 +815,17 @@ class NotesApp(QMainWindow):
                 continue
 
             for m in WIKILINK_RE.finditer(text):
-                dst = safe_filename(m.group(1).strip())
+                inner = (m.group(1) or "").strip()
+                if not inner:
+                    continue
+
+                # берём только target (до |), display игнорируем
+                if "|" in inner:
+                    target_raw = inner.split("|", 1)[0].strip()
+                else:
+                    target_raw = inner
+
+                dst = safe_filename(target_raw)
                 if dst not in title_set:
                     title_set.add(dst)  # виртуальный узел
                 if src != dst:
@@ -842,7 +898,17 @@ class NotesApp(QMainWindow):
 
             # ищем [[target]] (с учетом safe_filename)
             for m in WIKILINK_RE.finditer(text):
-                dst = safe_filename(m.group(1).strip())
+                inner = (m.group(1) or "").strip()
+                if not inner:
+                    continue
+
+                # берём только target (до |), display игнорируем
+                if "|" in inner:
+                    target_raw = inner.split("|", 1)[0].strip()
+                else:
+                    target_raw = inner
+
+                dst = safe_filename(target_raw)
                 if dst == target:
                     refs.append(src)
                     break
