@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import unicodedata
 import uuid
 import logging
 from logging.handlers import RotatingFileHandler
@@ -8,6 +9,8 @@ from pathlib import Path
 import math
 import random
 import time
+import html
+from urllib.parse import quote, unquote
 
 SESSION_ID = uuid.uuid4().hex[:8]
 
@@ -33,12 +36,62 @@ from PySide6.QtWidgets import (
     QGraphicsSimpleTextItem, QGraphicsItem, QDialog
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEnginePage
 
 import markdown as md
 
+# --- HTML sanitization (for Markdown preview rendered in QWebEngine) ---
+try:
+    import bleach  # pip install bleach
+except Exception:  # pragma: no cover
+    bleach = None
+
 WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
-APP_NAME = "mini_obsidian"
+ALLOWED_TAGS = [
+    "a", "p", "br", "hr",
+    "strong", "em", "code", "pre", "blockquote",
+    "ul", "ol", "li",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "table", "thead", "tbody", "tr", "th", "td",
+    # If you want images, uncomment "img" and its attrs below.
+    # "img",
+]
+
+ALLOWED_ATTRS = {
+    "a": ["href", "title"],
+    "th": ["align"], "td": ["align"],
+    # "img": ["src", "alt", "title"],
+}
+
+ALLOWED_PROTOCOLS = ["http", "https", "mailto", "note"]
+
+def sanitize_rendered_html(rendered_html: str) -> str:
+    """
+    Sanitize HTML output from Markdown before feeding it to QWebEngine.
+    Without this, raw HTML inside notes can execute in the embedded browser.
+    """
+    if bleach is None:
+        # Fallback: safest is to escape everything (no formatting),
+        # but that kills Markdown rendering. Instead, warn once and pass-through.
+        # Consider making bleach a hard dependency for release builds.
+        logging.getLogger("mini_obsidian").warning(
+            "bleach is not installed; Markdown HTML is not sanitized. "
+            "Install 'bleach' to prevent HTML/JS injection in preview."
+        )
+        return rendered_html
+
+    cleaned = bleach.clean(
+        rendered_html,
+        tags=ALLOWED_TAGS,
+        attributes=ALLOWED_ATTRS,
+        protocols=ALLOWED_PROTOCOLS,
+        strip=True,
+    )
+    # Also strip out any JS-able URLs that might slip through.
+    return cleaned
+
+APP_NAME = "obsidian-project"
 
 # Путь логов лучше не в cwd: он нестабилен для GUI приложений.
 LOG_DIR = Path.home() / f".{APP_NAME}" / "logs"
@@ -134,21 +187,97 @@ def install_global_exception_hooks() -> None:
         log.exception("Failed to install Qt message handler")
 
 def safe_filename(title: str) -> str:
-    # минимальная "санитизация" имени файла
-    title = title.strip().replace("/", "-").replace("\\", "-")
-    title = re.sub(r"\s+", " ", title)
-    return title
+    """
+    Делает безопасное имя файла из заголовка заметки.
+    Цели:
+      - кроссплатформенность (Windows/macOS/Linux)
+      - защита от "странных" символов/управляющих кодов
+      - ограничение длины
+      - защита от зарезервированных имён Windows (CON, PRN, ...)
+    """
+    if title is None:
+        return "Untitled"
 
+    # Unicode normalize: визуально одинаковые символы -> одно представление
+    s = unicodedata.normalize("NFKC", str(title))
+
+    # удаляем управляющие символы (включая \x00..)
+    s = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
+
+    # режем пробелы
+    s = s.strip()
+
+    # запретные разделители путей
+    s = s.replace("/", "-").replace("\\", "-")
+
+    # символы, запрещённые в Windows именах файлов: <>:"/\|?*
+    s = re.sub(r'[<>:"/\\|?*\u0000-\u001f]', "_", s)
+
+    # схлопываем пробелы/таб/переводы строк
+    s = re.sub(r"\s+", " ", s)
+
+    # Windows: имя не может заканчиваться пробелом или точкой
+    s = s.rstrip(" .")
+
+    # если пусто — даём дефолт
+    if not s:
+        s = "Untitled"
+
+    # Windows reserved device names (без учёта регистра, и даже с расширением)
+    # https://learn.microsoft.com/windows/win32/fileio/naming-a-file
+    base = s.split(".")[0].strip().lower()
+    reserved = {"con", "prn", "aux", "nul"}
+    reserved |= {f"com{i}" for i in range(1, 10)}
+    reserved |= {f"lpt{i}" for i in range(1, 10)}
+    if base in reserved:
+        s = f"_{s}"
+
+    # ограничим длину (безопасно для большинства FS). Расширения у нас фиксированные (.md),
+    # но оставим запас на всякий случай.
+    max_len = 120
+    if len(s) > max_len:
+        s = s[:max_len].rstrip(" .")
+
+    return s
 
 def wikilinks_to_html(markdown_text: str) -> str:
-    # заменяем [[Note]] на <a href="obsidian://Note">Note</a>
-    def repl(m):
-        name = m.group(1).strip()
-        label = name
-        href = f"note://{name}"
+    """
+    Заменяем [[Note]] на <a href="note://...">...</a>
+    Важно:
+      - label HTML-экранируем (защита от инъекций)
+      - href URL-энкодим (пробелы/юникод/спецсимволы)
+    """
+    def repl(m: re.Match) -> str:
+        raw = (m.group(1) or "").strip()
+        # label: показываем как есть, но безопасно для HTML
+        label = html.escape(raw, quote=False)
+        # href: URL encoding, чтобы не ломать атрибут и схему
+        href = "note://" + quote(raw, safe="")
         return f'<a href="{href}">{label}</a>'
 
     return WIKILINK_RE.sub(repl, markdown_text)
+
+
+class _NoteInterceptPage(QWebEnginePage):
+    """
+    Правильный перехват навигации: не даём QWebEngine реально "переходить"
+    на note://..., а просто эмитим сигнал во view.
+    """
+    def __init__(self, view: "LinkableWebView"):
+        super().__init__(view)
+        self._view = view
+
+    def acceptNavigationRequest(self, url, nav_type, isMainFrame):  # type: ignore[override]
+        if isMainFrame and url.scheme() == "note":
+            # Важно: для ссылок вида note://Title Qt кладёт "Title" в host(),
+            # а path() может быть пустым. Для note:///Title — наоборот.
+            raw = (url.path() or "").lstrip("/")
+            if not raw:
+                raw = url.host() or ""
+            title = unquote(raw).strip()
+            self._view.linkClicked.emit(title)
+            return False  # блокируем реальную навигацию
+        return super().acceptNavigationRequest(url, nav_type, isMainFrame)
 
 
 class LinkableWebView(QWebEngineView):
@@ -156,15 +285,7 @@ class LinkableWebView(QWebEngineView):
 
     def __init__(self):
         super().__init__()
-        # Перехват кликов по ссылкам
-        self.page().urlChanged.connect(self._on_url_changed)
-
-    def _on_url_changed(self, url):
-        # QWebEngine по умолчанию сам "переходит" по ссылкам; мы ловим кастомную схему
-        if url.scheme() == "note":
-            self.linkClicked.emit(url.path().lstrip("/"))
-            # возвращаемся "назад", чтобы не было пустой навигации
-            self.back()
+        self.setPage(_NoteInterceptPage(self))
 
 class QuickSwitcherDialog(QDialog):
     def __init__(self, parent, get_titles, on_open):
@@ -577,10 +698,14 @@ class NotesApp(QMainWindow):
     def _render_preview(self, text: str):
         # wiki links -> html links, потом markdown -> html
         text2 = wikilinks_to_html(text)
-        html = md.markdown(
+        rendered = md.markdown(
             text2,
             extensions=["fenced_code", "tables", "toc"]
         )
+
+        # sanitize HTML (защита от <script>, onerror, javascript: и т.п.)
+        rendered = sanitize_rendered_html(rendered)
+
         # простой стиль
         page = f"""
         <html>
@@ -594,7 +719,7 @@ class NotesApp(QMainWindow):
                 a:hover {{ text-decoration: underline; }}
             </style>
         </head>
-        <body>{html}</body>
+        <body>{rendered}</body>
         </html>
         """
         self.preview.setHtml(page)
@@ -767,7 +892,6 @@ class GraphNode(QGraphicsEllipseItem):
         self.label.setBrush(QBrush(theme["label"]))
         self.label.setPos(r + 6, -8)
         self.label.setOpacity(1.0)
-
 
     def hoverEnterEvent(self, event):
         self.setPen(self.pen_hover)
@@ -975,9 +1099,20 @@ class GraphView(QGraphicsView):
 
     def mousePressEvent(self, event):
         item = self.itemAt(event.position().toPoint())
-        if isinstance(item, GraphNode) and event.button() == Qt.LeftButton:
-            self.on_open_note(item.title)
-            return
+        if event.button() == Qt.LeftButton and item is not None:
+            # itemAt() может вернуть дочерний объект (например label: QGraphicsSimpleTextItem),
+            # поэтому поднимаемся вверх по иерархии, пока не найдем GraphNode.
+            node = None
+            cur = item
+            while cur is not None:
+                if isinstance(cur, GraphNode):
+                    node = cur
+                    break
+                cur = cur.parentItem()
+
+            if node is not None:
+                self.on_open_note(node.title)
+                return
         super().mousePressEvent(event)
 
     def build(self, nodes: list[str], edges: list[tuple[str, str]]):
