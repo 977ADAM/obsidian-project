@@ -13,6 +13,7 @@ import random
 import time
 import html
 from urllib.parse import quote, unquote
+from dataclasses import dataclass, field
 
 SESSION_ID = uuid.uuid4().hex[:8]
 
@@ -52,6 +53,90 @@ except Exception:  # pragma: no cover
 _BLEACH_MISSING_WARNED = False
 
 WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
+
+def extract_wikilink_targets(markdown_text: str) -> set[str]:
+    """
+    Парсит [[target]] и [[target|alias]] и возвращает множество канонических target
+    (через safe_filename).
+    """
+    targets: set[str] = set()
+    for m in WIKILINK_RE.finditer(markdown_text or ""):
+        inner = (m.group(1) or "").strip()
+        if not inner:
+            continue
+        if "|" in inner:
+            target_raw = inner.split("|", 1)[0].strip()
+        else:
+            target_raw = inner
+        dst = safe_filename(target_raw)
+        if dst:
+            targets.add(dst)
+    return targets
+
+
+@dataclass
+class LinkIndex:
+    """
+    Индекс ссылок:
+        outgoing[src] = {dst1, dst2, ...}
+        incoming[dst] = {src1, src2, ...}
+
+    dst может быть "виртуальным" (заметка ещё не существует как файл).
+    """
+    outgoing: dict[str, set[str]] = field(default_factory=dict)
+    incoming: dict[str, set[str]] = field(default_factory=dict)
+
+    def clear(self) -> None:
+        self.outgoing.clear()
+        self.incoming.clear()
+
+    def rebuild_from_vault(self, vault_dir: Path) -> None:
+        self.clear()
+        for p in vault_dir.glob("*.md"):
+            src = p.stem
+            try:
+                text = p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            self.update_note(src, text)
+
+    def update_note(self, src: str, markdown_text: str) -> None:
+        """
+        Инкрементально обновляет индекс для одной заметки src.
+        """
+        src = safe_filename(src)
+        if not src:
+            return
+
+        new_targets = extract_wikilink_targets(markdown_text)
+        # self-links не держим
+        new_targets.discard(src)
+
+        old_targets = self.outgoing.get(src, set())
+        if old_targets == new_targets:
+            return
+        # убрать старые обратные связи
+        for dst in old_targets - new_targets:
+            inc = self.incoming.get(dst)
+            if inc:
+                inc.discard(src)
+                if not inc:
+                    self.incoming.pop(dst, None)
+
+        # добавить новые обратные связи
+        for dst in new_targets - old_targets:
+            self.incoming.setdefault(dst, set()).add(src)
+
+        # обновить outgoing
+        if new_targets:
+            self.outgoing[src] = set(new_targets)
+        else:
+            self.outgoing.pop(src, None)
+
+    def backlinks_for(self, target: str) -> list[str]:
+        target = safe_filename(target)
+        refs = sorted(self.incoming.get(target, set()), key=str.lower)
+        return refs
 
 ALLOWED_TAGS = [
     "a", "p", "br", "hr",
@@ -398,6 +483,9 @@ class NotesApp(QMainWindow):
         self.vault_dir: Path | None = None
         self.current_path: Path | None = None
 
+        # --- LINK INDEX ---
+        self._link_index = LinkIndex()
+
         # ---- NAV HISTORY ----
         self._nav_back: list[str] = []
         self._nav_forward: list[str] = []
@@ -629,6 +717,8 @@ class NotesApp(QMainWindow):
                 tmp.mkdir(exist_ok=True)
                 self.vault_dir = tmp
                 log.warning("Хранилище не выбрано. Используется резервное хранилище=%s", tmp)
+                # индекс строим сразу (пусть даже пустой)
+                self._rebuild_link_index()
                 self.refresh_list()
             else:
                 log.info("Выбор хранилища отменён. Сохраняется хранилище=%s", self.vault_dir)
@@ -642,8 +732,25 @@ class NotesApp(QMainWindow):
         self.editor.clear()
         self.editor.blockSignals(False)
         self._dirty = False
+
+        self._rebuild_link_index()
         self.refresh_list()
         self.request_build_link_graph()
+
+    def _rebuild_link_index(self) -> None:
+        if self.vault_dir is None:
+            self._link_index.clear()
+            return
+        t0 = time.perf_counter()
+        self._link_index.rebuild_from_vault(self.vault_dir)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        log.info(
+            "Link index rebuilt: notes=%d incoming_keys=%d outgoing_keys=%d time_ms=%.1f",
+            len(list(self.vault_dir.glob("*.md"))),
+            len(self._link_index.incoming),
+            len(self._link_index.outgoing),
+            dt_ms,
+        )
 
     def list_notes(self) -> list[Path]:
         assert self.vault_dir is not None
@@ -781,7 +888,12 @@ class NotesApp(QMainWindow):
         log.info("Сохранение заметки: %s", self.current_path)
 
         try:
-            self.current_path.write_text(self.editor.toPlainText(), encoding="utf-8")
+            text = self.editor.toPlainText()
+            self.current_path.write_text(text, encoding="utf-8")
+
+            # --- update link index incrementally (fast) ---
+            self._link_index.update_note(self.current_path.stem, text)
+
             self._dirty = False
             self.refresh_list()
             self.request_build_link_graph()
@@ -797,38 +909,7 @@ class NotesApp(QMainWindow):
             return
 
         target = self.current_path.stem
-        files = list(self.vault_dir.glob("*.md"))
-
-        refs = []
-        for p in files:
-            src = p.stem
-            if src == target:
-                continue
-            try:
-                text = p.read_text(encoding="utf-8")
-            except Exception as e:
-                log.warning("Не удалось прочитать файл %s: %s", p, e)
-                continue
-
-            # ищем [[target]] (с учетом safe_filename)
-            for m in WIKILINK_RE.finditer(text):
-                inner = (m.group(1) or "").strip()
-                if not inner:
-                    continue
-
-                # берём только target (до |), display игнорируем
-                if "|" in inner:
-                    target_raw = inner.split("|", 1)[0].strip()
-                else:
-                    target_raw = inner
-
-                dst = safe_filename(target_raw)
-                if dst == target:
-                    refs.append(src)
-                    break
-
-        # unique + sort
-        refs = sorted(set(refs), key=str.lower)
+        refs = self._link_index.backlinks_for(target)
         log.debug("Обратные ссылки обновлены: цель=%s считать=%d", target, len(refs))
         for r in refs:
             self.backlinks.addItem(r)
@@ -855,12 +936,22 @@ class NotesApp(QMainWindow):
         depth = int(self.graph_depth)
         center = self.current_path.stem if self.current_path else None
 
+        # snapshot index so worker doesn't touch UI state
+        outgoing_snapshot: dict[str, list[str]] = {
+            src: sorted(dsts)
+            for src, dsts in self._link_index.outgoing.items()
+        }
+        # real notes on disk
+        existing_titles = {p.stem for p in vault_dir.glob("*.md")}
+
         worker = _GraphBuildWorker(
             req_id=req_id,
             vault_dir=vault_dir,
             mode=mode,
             depth=depth,
             center=center,
+            outgoing_snapshot=outgoing_snapshot,
+            existing_titles=existing_titles,
         )
         worker.signals.finished.connect(self._on_graph_built)
         worker.signals.failed.connect(self._on_graph_build_failed)
@@ -909,46 +1000,43 @@ class _GraphBuildSignals(QObject):
 
 
 class _GraphBuildWorker(QRunnable):
-    def __init__(self, req_id: int, vault_dir: Path, mode: str, depth: int, center: str | None):
+    def __init__(
+        self,
+        req_id: int,
+        vault_dir: Path,
+        mode: str,
+        depth: int,
+        center: str | None,
+        outgoing_snapshot: dict[str, list[str]],
+        existing_titles: set[str],
+    ):
         super().__init__()
         self.req_id = req_id
         self.vault_dir = vault_dir
         self.mode = mode
         self.depth = max(1, int(depth))
         self.center = center
+        self.outgoing_snapshot = outgoing_snapshot
+        self.existing_titles = existing_titles
         self.signals = _GraphBuildSignals()
 
     def run(self):
         t0 = time.perf_counter()
         try:
-            files = list(self.vault_dir.glob("*.md"))
-            title_set = {p.stem for p in files}
+            # Build from snapshot (fast, no disk IO)
+            title_set = set(self.existing_titles)
             edges_all: list[tuple[str, str]] = []
 
-            for p in files:
-                src = p.stem
-                try:
-                    text = p.read_text(encoding="utf-8")
-                except Exception:
-                    # can't safely use UI logger here with Qt objects; keep it minimal
-                    continue
-
-                for m in WIKILINK_RE.finditer(text):
-                    inner = (m.group(1) or "").strip()
-                    if not inner:
-                        continue
-
-                    if "|" in inner:
-                        target_raw = inner.split("|", 1)[0].strip()
-                    else:
-                        target_raw = inner
-
-                    dst = safe_filename(target_raw)
+            for src, dst_list in self.outgoing_snapshot.items():
+                if src not in title_set:
+                    title_set.add(src)  # safety: shouldn't happen, but ok
+                for dst in dst_list:
                     if dst not in title_set:
                         title_set.add(dst)  # virtual node
                     if src != dst:
                         edges_all.append((src, dst))
 
+            # unique preserve order
             edges_all = list(dict.fromkeys(edges_all))
             nodes_all = sorted(title_set, key=str.lower)
 
