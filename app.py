@@ -29,7 +29,7 @@ class SessionAdapter(logging.LoggerAdapter):
         extra.setdefault("session", SESSION_ID)
         return msg, kwargs
 
-from PySide6.QtCore import Qt, QTimer, Signal, QPointF, QElapsedTimer
+from PySide6.QtCore import Qt, QTimer, Signal, QPointF, QElapsedTimer, QObject, QRunnable, QThreadPool, Slot
 from PySide6.QtGui import QAction, QPainter, QPen, QBrush, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -393,7 +393,7 @@ class NotesApp(QMainWindow):
     def __init__(self):
         super().__init__()
         log.info("Приложение инициализировано")
-        self.setWindowTitle("Mini-Obsidian (Python)")
+        self.setWindowTitle("obsidian-project (Python)")
 
         self.vault_dir: Path | None = None
         self.current_path: Path | None = None
@@ -461,6 +461,10 @@ class NotesApp(QMainWindow):
         self.preview_timer.setSingleShot(True)
         self.preview_timer.timeout.connect(self._render_preview_from_editor)
 
+        # ---- GRAPH BUILD (background) ----
+        self._graph_pool = QThreadPool.globalInstance()
+        self._graph_req_id = 0  # monotonically increasing; used to drop stale results
+
         # Signals
         self.search.textChanged.connect(self.refresh_list)
         self.listw.itemSelectionChanged.connect(self._on_select_note)
@@ -521,14 +525,14 @@ class NotesApp(QMainWindow):
             act_dark.setChecked(True); act_light.setChecked(False)
             self.graph.apply_theme("dark")
             # перестроим граф, чтобы ноды пересоздались с новой темой
-            self.build_link_graph()
+            self.request_build_link_graph()
             if self.current_path:
                 self.graph.highlight(self.current_path.stem)
 
         def set_light():
             act_light.setChecked(True); act_dark.setChecked(False)
             self.graph.apply_theme("light")
-            self.build_link_graph()
+            self.request_build_link_graph()
             if self.current_path:
                 self.graph.highlight(self.current_path.stem)
 
@@ -552,7 +556,7 @@ class NotesApp(QMainWindow):
             act_local1.setChecked(mode == "local" and depth == 1)
             act_local2.setChecked(mode == "local" and depth == 2)
 
-            self.build_link_graph()
+            self.request_build_link_graph()
             if self.current_path:
                 self.graph.highlight(self.current_path.stem)
 
@@ -609,7 +613,7 @@ class NotesApp(QMainWindow):
         self._render_preview(text)
         self._select_in_list(title)
 
-        self.build_link_graph()
+        self.request_build_link_graph()
         self.graph.highlight(title)
         self.graph.center_on(title)
         self.refresh_backlinks()
@@ -639,7 +643,7 @@ class NotesApp(QMainWindow):
         self.editor.blockSignals(False)
         self._dirty = False
         self.refresh_list()
-        self.build_link_graph()
+        self.request_build_link_graph()
 
     def list_notes(self) -> list[Path]:
         assert self.vault_dir is not None
@@ -780,102 +784,12 @@ class NotesApp(QMainWindow):
             self.current_path.write_text(self.editor.toPlainText(), encoding="utf-8")
             self._dirty = False
             self.refresh_list()
-            self.build_link_graph()
+            self.request_build_link_graph()
             self.refresh_backlinks()
+
         except Exception as e:
             log.exception("Сохранить не удалось: %s", self.current_path)
             QMessageBox.critical(self, "Ошибка сохранения", str(e))
-
-    def create_note_dialog(self):
-        # простой способ: используем строку поиска как ввод имени
-        title = self.search.text().strip()
-        if not title:
-            QMessageBox.information(self, "Новая заметка", "Введите название в поле поиска и нажмите 'Новая заметка…'")
-            return
-        self.open_or_create_by_title(title)
-
-    def build_link_graph(self):
-        if self.vault_dir is None:
-            return
-        
-        t0 = time.perf_counter()
-
-        files = list(self.vault_dir.glob("*.md"))
-        title_set = {p.stem for p in files}
-
-        # соберём все ребра + список виртуальных узлов
-        edges_all: list[tuple[str, str]] = []
-
-        for p in files:
-            src = p.stem
-            try:
-                text = p.read_text(encoding="utf-8")
-            except Exception:
-                log.warning("Не удалось прочитать файл для графа: %s", p, exc_info=True)
-                continue
-
-            for m in WIKILINK_RE.finditer(text):
-                inner = (m.group(1) or "").strip()
-                if not inner:
-                    continue
-
-                # берём только target (до |), display игнорируем
-                if "|" in inner:
-                    target_raw = inner.split("|", 1)[0].strip()
-                else:
-                    target_raw = inner
-
-                dst = safe_filename(target_raw)
-                if dst not in title_set:
-                    title_set.add(dst)  # виртуальный узел
-                if src != dst:
-                    edges_all.append((src, dst))
-
-        # уберем дубликаты
-        edges_all = list(dict.fromkeys(edges_all))
-        nodes_all = sorted(title_set, key=str.lower)
-
-        # --- LOCAL GRAPH ---
-        if self.graph_mode == "local" and self.current_path is not None:
-            center = self.current_path.stem
-            # строим adjacency
-            adj: dict[str, set[str]] = {n: set() for n in nodes_all}
-            for a, b in edges_all:
-                if a in adj:
-                    adj[a].add(b)
-                if b in adj:
-                    adj[b].add(a)
-
-            # BFS на depth hops
-            depth = max(1, int(self.graph_depth))
-            visited = {center}
-            frontier = {center}
-            for _ in range(depth):
-                nxt = set()
-                for v in frontier:
-                    nxt |= adj.get(v, set())
-                nxt -= visited
-                visited |= nxt
-                frontier = nxt
-
-            nodes = sorted(visited, key=str.lower)
-            node_set = set(nodes)
-            edges = [(a, b) for (a, b) in edges_all if a in node_set and b in node_set]
-
-            self.graph.build(nodes, edges)
-
-            dt = (time.perf_counter() - t0) * 1000.0
-            log.debug("График построен: режим=%s глубина=%s узлы=%d края=%d time_ms=%.1f",
-                self.graph_mode, self.graph_depth, len(nodes_all), len(edges_all), dt)
-            
-            return
-
-        # --- GLOBAL GRAPH ---
-        self.graph.build(nodes_all, edges_all)
-
-        dt = (time.perf_counter() - t0) * 1000.0
-        log.debug("Граф построен: режим=%s глубина=%s узлы=%d края=%d time_ms=%.1f",
-            self.graph_mode, self.graph_depth, len(nodes_all), len(edges_all), dt)
 
     def refresh_backlinks(self):
         self.backlinks.clear()
@@ -918,6 +832,166 @@ class NotesApp(QMainWindow):
         log.debug("Обратные ссылки обновлены: цель=%s считать=%d", target, len(refs))
         for r in refs:
             self.backlinks.addItem(r)
+
+    def create_note_dialog(self):
+        # простой способ: используем строку поиска как ввод имени
+        title = self.search.text().strip()
+        if not title:
+            QMessageBox.information(self, "Новая заметка", "Введите название в поле поиска и нажмите 'Новая заметка…'")
+            return
+        self.open_or_create_by_title(title)
+
+    def request_build_link_graph(self):
+        """Build graph off the UI thread; apply result when ready (drops stale results)."""
+        if self.vault_dir is None:
+            return
+
+        self._graph_req_id += 1
+        req_id = self._graph_req_id
+
+        # snapshot inputs (so background thread doesn't touch mutable UI state)
+        vault_dir = self.vault_dir
+        mode = self.graph_mode
+        depth = int(self.graph_depth)
+        center = self.current_path.stem if self.current_path else None
+
+        worker = _GraphBuildWorker(
+            req_id=req_id,
+            vault_dir=vault_dir,
+            mode=mode,
+            depth=depth,
+            center=center,
+        )
+        worker.signals.finished.connect(self._on_graph_built)
+        worker.signals.failed.connect(self._on_graph_build_failed)
+        self._graph_pool.start(worker)
+
+    @Slot(object, object)
+    def _on_graph_built(self, req_id: int, payload: dict):
+        # Drop stale results (user navigated/saved again while worker was running)
+        if req_id != self._graph_req_id:
+            return
+
+        nodes = payload["nodes"]
+        edges = payload["edges"]
+        stats = payload.get("stats", {})
+
+        self.graph.build(nodes, edges)
+
+        # keep highlight centered on current note if any
+        if self.current_path:
+            cur = self.current_path.stem
+            self.graph.highlight(cur)
+            self.graph.center_on(cur)
+
+        log.debug(
+            "Граф построен (bg): режим=%s глубина=%s узлы=%d края=%d time_ms=%.1f",
+            stats.get("mode"), stats.get("depth"),
+            stats.get("nodes_all", len(nodes)),
+            stats.get("edges_all", len(edges)),
+            stats.get("time_ms", -1.0),
+        )
+
+    @Slot(object, object)
+    def _on_graph_build_failed(self, req_id: int, err: str):
+        if req_id != self._graph_req_id:
+            return
+        log.warning("Graph build failed (bg): %s", err)
+
+    # Backwards-compatible alias (optional): keep old name used elsewhere
+    def build_link_graph(self):
+        self.request_build_link_graph()
+
+
+class _GraphBuildSignals(QObject):
+    finished = Signal(object, object)  # (req_id:int, payload:dict)
+    failed = Signal(object, object)    # (req_id:int, err:str)
+
+
+class _GraphBuildWorker(QRunnable):
+    def __init__(self, req_id: int, vault_dir: Path, mode: str, depth: int, center: str | None):
+        super().__init__()
+        self.req_id = req_id
+        self.vault_dir = vault_dir
+        self.mode = mode
+        self.depth = max(1, int(depth))
+        self.center = center
+        self.signals = _GraphBuildSignals()
+
+    def run(self):
+        t0 = time.perf_counter()
+        try:
+            files = list(self.vault_dir.glob("*.md"))
+            title_set = {p.stem for p in files}
+            edges_all: list[tuple[str, str]] = []
+
+            for p in files:
+                src = p.stem
+                try:
+                    text = p.read_text(encoding="utf-8")
+                except Exception:
+                    # can't safely use UI logger here with Qt objects; keep it minimal
+                    continue
+
+                for m in WIKILINK_RE.finditer(text):
+                    inner = (m.group(1) or "").strip()
+                    if not inner:
+                        continue
+
+                    if "|" in inner:
+                        target_raw = inner.split("|", 1)[0].strip()
+                    else:
+                        target_raw = inner
+
+                    dst = safe_filename(target_raw)
+                    if dst not in title_set:
+                        title_set.add(dst)  # virtual node
+                    if src != dst:
+                        edges_all.append((src, dst))
+
+            edges_all = list(dict.fromkeys(edges_all))
+            nodes_all = sorted(title_set, key=str.lower)
+
+            # LOCAL graph selection (if requested and we have a center)
+            nodes = nodes_all
+            edges = edges_all
+            if self.mode == "local" and self.center:
+                adj: dict[str, set[str]] = {n: set() for n in nodes_all}
+                for a, b in edges_all:
+                    if a in adj:
+                        adj[a].add(b)
+                    if b in adj:
+                        adj[b].add(a)
+
+                visited = {self.center}
+                frontier = {self.center}
+                for _ in range(self.depth):
+                    nxt = set()
+                    for v in frontier:
+                        nxt |= adj.get(v, set())
+                    nxt -= visited
+                    visited |= nxt
+                    frontier = nxt
+
+                nodes = sorted(visited, key=str.lower)
+                node_set = set(nodes)
+                edges = [(a, b) for (a, b) in edges_all if a in node_set and b in node_set]
+
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            payload = {
+                "nodes": nodes,
+                "edges": edges,
+                "stats": {
+                    "mode": self.mode,
+                    "depth": self.depth,
+                    "nodes_all": len(nodes_all),
+                    "edges_all": len(edges_all),
+                    "time_ms": dt_ms,
+                },
+            }
+            self.signals.finished.emit(self.req_id, payload)
+        except Exception as e:
+            self.signals.failed.emit(self.req_id, str(e))
 
 class GraphNode(QGraphicsEllipseItem):
     def __init__(self, title: str, x: float, y: float, degree: int, theme: dict, r_base: float = 10.0):
