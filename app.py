@@ -112,7 +112,7 @@ class LinkIndex:
         # self-links не держим
         new_targets.discard(src)
 
-        old_targets = self.outgoing.get(src, set())
+        old_targets = set(self.outgoing.get(src, ()))
         if old_targets == new_targets:
             return
         # убрать старые обратные связи
@@ -285,7 +285,8 @@ def safe_filename(title: str) -> str:
       - защита от зарезервированных имён Windows (CON, PRN, ...)
     """
     if title is None:
-        return "Untitled"
+        # Avoid collisions on None -> unique untitled name
+        return f"Untitled-{uuid.uuid4().hex[:6]}"
 
     # Unicode normalize: визуально одинаковые символы -> одно представление
     s = unicodedata.normalize("NFKC", str(title))
@@ -308,9 +309,9 @@ def safe_filename(title: str) -> str:
     # Windows: имя не может заканчиваться пробелом или точкой
     s = s.rstrip(" .")
 
-    # если пусто — даём дефолт
+    # если пусто — даём дефолт (уникальный, чтобы не перетирать файлы)
     if not s:
-        s = "Untitled"
+        s = f"Untitled-{uuid.uuid4().hex[:6]}"
 
     # Windows reserved device names (без учёта регистра, и даже с расширением)
     # https://learn.microsoft.com/windows/win32/fileio/naming-a-file
@@ -483,6 +484,10 @@ class NotesApp(QMainWindow):
         self.vault_dir: Path | None = None
         self.current_path: Path | None = None
 
+        # Token that changes every time we open/switch note.
+        # Used to avoid autosave race writing to the wrong file.
+        self._note_token: str = uuid.uuid4().hex
+
         # --- LINK INDEX ---
         self._link_index = LinkIndex()
 
@@ -492,6 +497,10 @@ class NotesApp(QMainWindow):
         self._nav_suppress = False  # чтобы back/forward не писали сами себя в историю
 
         self._dirty = False
+        self._pending_save_token: str = self._note_token
+        # Последняя сохранённая/загруженная версия текста текущей заметки.
+        # Нужна, чтобы не терять изменения при переключении (даже если _dirty "не успел").
+        self._last_saved_text: str = ""
         self.graph_mode = "global"   # "global" | "local"
         self.graph_depth = 1         # 1 или 2
 
@@ -564,6 +573,21 @@ class NotesApp(QMainWindow):
 
         # Start: ask vault
         self.choose_vault()
+
+    def closeEvent(self, event):  # type: ignore[override]
+        """
+        Ensure last edits are persisted on window close.
+        Protects against data loss when autosave timer hasn't fired yet.
+        """
+        try:
+            if self.save_timer.isActive():
+                self.save_timer.stop()
+            if self.preview_timer.isActive():
+                self.preview_timer.stop()
+            self._flush_current_note_before_switch()
+        except Exception:
+            log.exception("Failed to flush note on close")
+        super().closeEvent(event)
 
     def _build_menu(self):
         menubar = self.menuBar()
@@ -683,14 +707,16 @@ class NotesApp(QMainWindow):
         if self.preview_timer.isActive():
             self.preview_timer.stop()
 
-        # save previous
-        self._save_current_if_needed()
+        # Надёжно сохраняем предыдущую заметку перед переключением.
+        # Не полагаемся только на _dirty: сравниваем текст фактически.
+        self._flush_current_note_before_switch()
 
         if not path.exists():
             log.info("Примечание не существует, создаём: %s", path)
             path.write_text(f"# {title}\n\n", encoding="utf-8")
 
         self.current_path = path
+        self._note_token = uuid.uuid4().hex
         text = path.read_text(encoding="utf-8")
 
         self.editor.blockSignals(True)
@@ -698,6 +724,7 @@ class NotesApp(QMainWindow):
         self.editor.blockSignals(False)
 
         self._dirty = False
+        self._last_saved_text = text
         self._render_preview(text)
         self._select_in_list(title)
 
@@ -713,8 +740,8 @@ class NotesApp(QMainWindow):
         if not path:
             # если пользователь отменил и vault ещё не выбран — создадим временную папку рядом
             if self.vault_dir is None:
-                tmp = Path.cwd() / "vault"
-                tmp.mkdir(exist_ok=True)
+                tmp = Path.home() / f".{APP_NAME}" / "vault"
+                tmp.mkdir(parents=True, exist_ok=True)
                 self.vault_dir = tmp
                 log.warning("Хранилище не выбрано. Используется резервное хранилище=%s", tmp)
                 # индекс строим сразу (пусть даже пустой)
@@ -732,6 +759,7 @@ class NotesApp(QMainWindow):
         self.editor.clear()
         self.editor.blockSignals(False)
         self._dirty = False
+        self._last_saved_text = ""
 
         self._rebuild_link_index()
         self.refresh_list()
@@ -844,6 +872,8 @@ class NotesApp(QMainWindow):
 
     def _on_text_changed(self):
         self._dirty = True
+        # remember which note the pending autosave belongs to
+        self._pending_save_token = self._note_token
         # Не рендерим превью на каждый символ — дебаунсим.
         self.preview_timer.start()
         self.save_timer.start()
@@ -884,6 +914,12 @@ class NotesApp(QMainWindow):
     def _save_current_if_needed(self):
         if not self._dirty or self.current_path is None:
             return
+
+        # If user switched notes after typing, do not write editor content
+        # into a different file.
+        if getattr(self, "_pending_save_token", None) != self._note_token:
+            log.debug("Autosave skipped: note switched before timer fired")
+            return
         
         log.info("Сохранение заметки: %s", self.current_path)
 
@@ -895,12 +931,33 @@ class NotesApp(QMainWindow):
             self._link_index.update_note(self.current_path.stem, text)
 
             self._dirty = False
+            self._last_saved_text = text
             self.refresh_list()
             self.request_build_link_graph()
             self.refresh_backlinks()
 
         except Exception as e:
             log.exception("Сохранить не удалось: %s", self.current_path)
+            QMessageBox.critical(self, "Ошибка сохранения", str(e))
+
+    def _flush_current_note_before_switch(self) -> None:
+        """
+        Гарантированно сохраняет текущую заметку перед переключением, если текст реально изменился.
+        Это защищает от редких гонок/сценариев, когда _dirty не успел выставиться, а таймер уже остановили.
+        """
+        if self.current_path is None:
+            return
+        try:
+            current_text = self.editor.toPlainText()
+            if current_text == self._last_saved_text:
+                return  # ничего не изменилось
+            log.info("Flush-save before switch: %s", self.current_path)
+            self.current_path.write_text(current_text, encoding="utf-8")
+            self._link_index.update_note(self.current_path.stem, current_text)
+            self._dirty = False
+            self._last_saved_text = current_text
+        except Exception as e:
+            log.exception("Flush-save failed: %s", self.current_path)
             QMessageBox.critical(self, "Ошибка сохранения", str(e))
 
     def refresh_backlinks(self):
@@ -957,7 +1014,7 @@ class NotesApp(QMainWindow):
         worker.signals.failed.connect(self._on_graph_build_failed)
         self._graph_pool.start(worker)
 
-    @Slot(object, object)
+    @Slot(int, dict)
     def _on_graph_built(self, req_id: int, payload: dict):
         # Drop stale results (user navigated/saved again while worker was running)
         if req_id != self._graph_req_id:
@@ -983,7 +1040,7 @@ class NotesApp(QMainWindow):
             stats.get("time_ms", -1.0),
         )
 
-    @Slot(object, object)
+    @Slot(int, str)
     def _on_graph_build_failed(self, req_id: int, err: str):
         if req_id != self._graph_req_id:
             return
@@ -995,8 +1052,8 @@ class NotesApp(QMainWindow):
 
 
 class _GraphBuildSignals(QObject):
-    finished = Signal(object, object)  # (req_id:int, payload:dict)
-    failed = Signal(object, object)    # (req_id:int, err:str)
+    finished = Signal(int, dict)
+    failed = Signal(int, str)
 
 
 class _GraphBuildWorker(QRunnable):
