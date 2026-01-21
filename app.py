@@ -15,8 +15,11 @@ from urllib.parse import unquote
 from datetime import datetime
 
 from app.core.filenames import safe_filename
-from app.core.wikilinks import rewrite_wikilinks_targets, wikilinks_to_html
+from app.core.wikilinks import wikilinks_to_html
 from app.core.links import LinkIndex
+from app.workers.rename_rewrite import RenameRewriteWorker
+from app.infrastructure.filesystem import atomic_write_text, write_recovery_copy
+from app.services.graph_service import GraphService
 
 SESSION_ID = uuid.uuid4().hex[:8]
 
@@ -101,58 +104,6 @@ def sanitize_rendered_html(rendered_html: str) -> str:
     )
     # Also strip out any JS-able URLs that might slip through.
     return cleaned
-
-def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
-    """
-    Atomic-ish file write:
-      - write to temp file in same directory
-      - fsync
-      - replace() into final path
-    Helps prevent partial writes on crash/power loss.
-    """
-    path = Path(path)
-    parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-
-    tmp_name = f".{path.name}.tmp-{uuid.uuid4().hex}"
-    tmp_path = parent / tmp_name
-
-    f = None
-    try:
-        f = open(tmp_path, "w", encoding=encoding, newline="")
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-        f.close()
-        f = None
-        tmp_path.replace(path)
-    finally:
-        try:
-            if f is not None:
-                f.close()
-        except Exception:
-            pass
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except Exception:
-            pass
-
-# Recovery copies (when save fails) go here:
-RECOVERY_DIR = Path.home() / f".{APP_NAME}" / "recovery"
-RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
-
-def write_recovery_copy(note_path: Path, text: str) -> Path:
-    """
-    Best-effort emergency save when normal save fails.
-    Writes a timestamped copy into ~/.<APP_NAME>/recovery/.
-    """
-    note_path = Path(note_path)
-    stem = note_path.stem if note_path.stem else "Untitled"
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    rec_path = RECOVERY_DIR / f"{stem}.recovery.{ts}.md"
-    atomic_write_text(rec_path, text, encoding="utf-8")
-    return rec_path
 
 # Путь логов лучше не в cwd: он нестабилен для GUI приложений.
 LOG_DIR = Path.home() / f".{APP_NAME}" / "logs"
@@ -487,12 +438,12 @@ class NotesApp(QMainWindow):
 
         # ---- GRAPH BUILD (background) ----
         self._graph_pool = QThreadPool.globalInstance()
-        self._graph_req_id = 0  # monotonically increasing; used to drop stale results
-        # Debounce graph rebuild requests (avoid rebuilding on every autosave)
-        self._graph_debounce_timer = QTimer(self)
-        self._graph_debounce_timer.setInterval(1200)  # ms (tune as needed)
-        self._graph_debounce_timer.setSingleShot(True)
-        self._graph_debounce_timer.timeout.connect(self._request_build_link_graph_now)
+
+        self.graph_service = GraphService(
+            thread_pool=QThreadPool.globalInstance(),
+            on_finished=self._on_graph_built,
+            on_failed=self._on_graph_build_failed,
+        )
 
         # ---- RENAME REWRITE (background) ----
         self._rename_pool = QThreadPool.globalInstance()
@@ -607,7 +558,19 @@ class NotesApp(QMainWindow):
         try:
             self.graph.apply_theme(name)
             # перестроим граф, чтобы ноды пересоздались с новой темой
-            self.request_build_link_graph(immediate=True)
+            self.graph_service.request_build(
+                mode=self.graph_mode,
+                depth=self.graph_depth,
+                center=self.current_path.stem if self.current_path else None,
+                outgoing_snapshot={
+                    k: list(v) for k, v in self._link_index.outgoing.items()
+                },
+                existing_titles=set(self._link_index.outgoing.keys())
+                                | set(self._link_index.incoming.keys()),
+                max_nodes=self.max_graph_nodes,
+                max_steps=self.max_graph_steps,
+                immediate=True,
+            )
             if self.current_path:
                 self.graph.highlight(self.current_path.stem)
         except Exception:
@@ -635,7 +598,19 @@ class NotesApp(QMainWindow):
             self._act_graph_local2.setChecked(mode == "local" and depth == 2)
 
         try:
-            self.request_build_link_graph(immediate=True)
+            self.graph_service.request_build(
+                mode=self.graph_mode,
+                depth=self.graph_depth,
+                center=self.current_path.stem if self.current_path else None,
+                outgoing_snapshot={
+                    k: list(v) for k, v in self._link_index.outgoing.items()
+                },
+                existing_titles=set(self._link_index.outgoing.keys())
+                                | set(self._link_index.incoming.keys()),
+                max_nodes=self.max_graph_nodes,
+                max_steps=self.max_graph_steps,
+                immediate=True,
+            )
             if self.current_path:
                 self.graph.highlight(self.current_path.stem)
         except Exception:
@@ -681,7 +656,19 @@ class NotesApp(QMainWindow):
 
         self._rebuild_link_index()
         self.refresh_list()
-        self.request_build_link_graph(immediate=True)
+        self.graph_service.request_build(
+            mode=self.graph_mode,
+            depth=self.graph_depth,
+            center=self.current_path.stem if self.current_path else None,
+            outgoing_snapshot={
+                k: list(v) for k, v in self._link_index.outgoing.items()
+            },
+            existing_titles=set(self._link_index.outgoing.keys())
+                            | set(self._link_index.incoming.keys()),
+            max_nodes=self.max_graph_nodes,
+            max_steps=self.max_graph_steps,
+            immediate=True,
+        )
 
     def closeEvent(self, event):  # type: ignore[override]
         """
@@ -823,7 +810,19 @@ class NotesApp(QMainWindow):
         self._render_preview(text)
         self._select_in_list(title)
 
-        self.request_build_link_graph(immediate=True)
+        self.graph_service.request_build(
+            mode=self.graph_mode,
+            depth=self.graph_depth,
+            center=self.current_path.stem if self.current_path else None,
+            outgoing_snapshot={
+                k: list(v) for k, v in self._link_index.outgoing.items()
+            },
+            existing_titles=set(self._link_index.outgoing.keys())
+                            | set(self._link_index.incoming.keys()),
+            max_nodes=self.max_graph_nodes,
+            max_steps=self.max_graph_steps,
+            immediate=True,
+        )
         self.graph.highlight(title)
         self.graph.center_on(title)
         self.refresh_backlinks()
@@ -1218,7 +1217,7 @@ class NotesApp(QMainWindow):
         # На время операции — ограничим редактирование (уменьшаем риски гонок/конфликтов).
         self._set_ui_busy(True)
 
-        worker = _RenameRewriteWorker(
+        worker = RenameRewriteWorker(
             req_id=req_id,
             vault_dir=self.vault_dir,
             files=files,
@@ -1304,7 +1303,19 @@ class NotesApp(QMainWindow):
 
         self.refresh_list()
         self._select_in_list(new_path.stem)
-        self.request_build_link_graph(immediate=True)
+        self.graph_service.request_build(
+            mode=self.graph_mode,
+            depth=self.graph_depth,
+            center=self.current_path.stem if self.current_path else None,
+            outgoing_snapshot={
+                k: list(v) for k, v in self._link_index.outgoing.items()
+            },
+            existing_titles=set(self._link_index.outgoing.keys())
+                            | set(self._link_index.incoming.keys()),
+            max_nodes=self.max_graph_nodes,
+            max_steps=self.max_graph_steps,
+            immediate=True,
+        )
         self.graph.highlight(new_path.stem)
         self.graph.center_on(new_path.stem)
         self.refresh_backlinks()
@@ -1388,8 +1399,6 @@ class NotesApp(QMainWindow):
             self._dirty = False
             self._last_saved_text = text
             self.refresh_list()
-            if links_changed:
-                self.request_build_link_graph()  # debounced by default
             self.refresh_backlinks()
             return True
 
@@ -1454,68 +1463,12 @@ class NotesApp(QMainWindow):
             return
         self.open_or_create_by_title(title)
 
-    def request_build_link_graph(self, immediate: bool = False):
-        """
-        Build graph off the UI thread; debounce by default to avoid rebuilding on every autosave.
-        Use immediate=True when user action expects instant rebuild (theme/mode/vault/open).
-        """
-        if self.vault_dir is None:
-            return
-        if immediate:
-            if self._graph_debounce_timer.isActive():
-                self._graph_debounce_timer.stop()
-            self._request_build_link_graph_now()
-        else:
-            # restart debounce window
-            self._graph_debounce_timer.start()
-
-    def _request_build_link_graph_now(self):
-        """Build graph off the UI thread; apply result when ready (drops stale results)."""
-        if self.vault_dir is None:
-            return
-
-        self._graph_req_id += 1
-        req_id = self._graph_req_id
-
-        # snapshot inputs (so background thread doesn't touch mutable UI state)
-        vault_dir = self.vault_dir
-        mode = self.graph_mode
-        depth = int(self.graph_depth)
-        center = self.current_path.stem if self.current_path else None
-
-        # snapshot index so worker doesn't touch UI state
-        outgoing_snapshot: dict[str, list[str]] = {
-            src: sorted(dsts)
-            for src, dsts in self._link_index.outgoing.items()
-        }
-        # real notes on disk
-        existing_titles = {p.stem for p in vault_dir.glob("*.md")}
-
-        worker = _GraphBuildWorker(
-            req_id=req_id,
-            vault_dir=vault_dir,
-            mode=mode,
-            depth=depth,
-            center=center,
-            outgoing_snapshot=outgoing_snapshot,
-            existing_titles=existing_titles,
-            max_nodes=int(self.max_graph_nodes),
-            max_steps=int(self.max_graph_steps),
-        )
-        worker.signals.finished.connect(self._on_graph_built)
-        worker.signals.failed.connect(self._on_graph_build_failed)
-        self._graph_pool.start(worker)
-
     @Slot(int, dict)
     def _on_graph_built(self, req_id: int, payload: dict):
-        # Drop stale results (user navigated/saved again while worker was running)
-        if req_id != self._graph_req_id:
-            return
-
         nodes = payload["nodes"]
         edges = payload["edges"]
         stats = payload.get("stats", {})
-        # pass dynamic layout steps to GraphView (UI thread)
+        
         try:
             self.graph._layout_steps = int(payload.get("layout_steps") or stats.get("layout_steps") or 250)
         except Exception:
@@ -1523,7 +1476,6 @@ class NotesApp(QMainWindow):
 
         self.graph.build(nodes, edges)
 
-        # keep highlight centered on current note if any
         if self.current_path:
             cur = self.current_path.stem
             self.graph.highlight(cur)
@@ -1539,208 +1491,23 @@ class NotesApp(QMainWindow):
 
     @Slot(int, str)
     def _on_graph_build_failed(self, req_id: int, err: str):
-        if req_id != self._graph_req_id:
-            return
-        log.warning("Graph build failed (bg): %s", err)
+        log.warning("Graph build failed: %s", err)
 
-    # Backwards-compatible alias (optional): keep old name used elsewhere
+    # Backwards-compatible alias (optional): keep old name used elsewhere self.request_build_link_graph(immediate=True)
     def build_link_graph(self):
-        self.request_build_link_graph(immediate=True)
-
-class _RenameRewriteSignals(QObject):
-    progress = Signal(int, int, int, str)  # req_id, done, total, filename
-    finished = Signal(int, dict)           # req_id, result
-    failed = Signal(int, str)              # req_id, err
-
-
-class _RenameRewriteWorker(QRunnable):
-    def __init__(
-        self,
-        *,
-        req_id: int,
-        vault_dir: Path,
-        files: list[Path],
-        old_stem: str,
-        new_stem: str,
-        cancel_event: threading.Event,
-    ):
-        super().__init__()
-        self.req_id = req_id
-        self.vault_dir = vault_dir
-        self.files = files
-        self.old_stem = safe_filename(old_stem)
-        self.new_stem = safe_filename(new_stem)
-        self.cancel_event = cancel_event
-        self.signals = _RenameRewriteSignals()
-
-    def run(self) -> None:
-        try:
-            changed_files = 0
-            total_files = len(self.files)
-            error_files: list[str] = []
-            done = 0
-            canceled = False
-
-            for p in self.files:
-                # Пользователь нажал "Отмена"
-                if self.cancel_event.is_set():
-                    canceled = True
-                    break
-
-                done += 1
-                try:
-                    # прогресс: имя файла
-                    self.signals.progress.emit(self.req_id, done, total_files, p.name)
-
-                    txt = p.read_text(encoding="utf-8")
-
-                    # --- BACKUP BEFORE REWRITE ---
-                    backup_path = p.with_suffix(p.suffix + ".bak")
-                    if not backup_path.exists():
-                        atomic_write_text(backup_path, txt, encoding="utf-8")
-
-                    new_txt, changed = rewrite_wikilinks_targets(
-                        txt,
-                        old_stem=self.old_stem,
-                        new_stem=self.new_stem,
-                    )
-                    if changed:
-                        atomic_write_text(p, new_txt, encoding="utf-8")
-                        changed_files += 1
-                except Exception:
-                    error_files.append(str(p))
-                    # продолжаем, не валим всю операцию
-                    continue
-
-            result = {
-                "old_stem": self.old_stem,
-                "new_stem": self.new_stem,
-                "total_files": total_files,
-                "changed_files": changed_files,
-                "error_files": error_files,
-                "canceled": canceled,
-            }
-            self.signals.finished.emit(self.req_id, result)
-        except Exception as e:
-            self.signals.failed.emit(self.req_id, str(e))
-
-    # NOTE: _RenameRewriteWorker должен содержать только __init__/run и сигналы.
-    # Любые методы NotesApp сюда не должны попадать.
-
-class _GraphBuildSignals(QObject):
-    finished = Signal(int, dict)
-    failed = Signal(int, str)
-
-
-class _GraphBuildWorker(QRunnable):
-    def __init__(
-        self,
-        req_id: int,
-        vault_dir: Path,
-        mode: str,
-        depth: int,
-        center: str | None,
-        outgoing_snapshot: dict[str, list[str]],
-        existing_titles: set[str],
-        max_nodes: int = 400,
-        max_steps: int = 250,
-    ):
-        super().__init__()
-        self.req_id = req_id
-        self.vault_dir = vault_dir
-        self.mode = mode
-        self.depth = max(1, int(depth))
-        self.center = center
-        self.outgoing_snapshot = outgoing_snapshot
-        self.existing_titles = existing_titles
-        self.max_nodes = max(50, int(max_nodes))
-        self.max_steps = max(30, int(max_steps))
-        self.signals = _GraphBuildSignals()
-
-    def run(self):
-        t0 = time.perf_counter()
-        try:
-            # Build from snapshot (fast, no disk IO)
-            title_set = set(self.existing_titles)
-            edges_all: list[tuple[str, str]] = []
-
-            for src, dst_list in self.outgoing_snapshot.items():
-                if src not in title_set:
-                    title_set.add(src)  # safety: shouldn't happen, but ok
-                for dst in dst_list:
-                    if dst not in title_set:
-                        title_set.add(dst)  # virtual node
-                    if src != dst:
-                        edges_all.append((src, dst))
-
-            # unique preserve order
-            edges_all = list(dict.fromkeys(edges_all))
-            nodes_all = sorted(title_set, key=str.lower)
-
-            # Limit graph size in GLOBAL mode to prevent O(n^2) layout blowups.
-            # Strategy: keep highest-degree nodes, always keep center (if any).
-            if self.mode == "global" and len(nodes_all) > self.max_nodes:
-                deg: dict[str, int] = {n: 0 for n in nodes_all}
-                for a, b in edges_all:
-                    if a in deg: deg[a] += 1
-                    if b in deg: deg[b] += 1
-
-                # rank by degree desc, then name
-                ranked = sorted(nodes_all, key=lambda n: (-deg.get(n, 0), n.lower()))
-                keep = ranked[: self.max_nodes]
-                if self.center and self.center in deg and self.center not in keep:
-                    keep[-1] = self.center
-                node_set = set(keep)
-                nodes_all = sorted(node_set, key=str.lower)
-                edges_all = [(a, b) for (a, b) in edges_all if a in node_set and b in node_set]
-
-            # LOCAL graph selection (if requested and we have a center)
-            nodes = nodes_all
-            edges = edges_all
-            if self.mode == "local" and self.center:
-                adj: dict[str, set[str]] = {n: set() for n in nodes_all}
-                for a, b in edges_all:
-                    if a in adj:
-                        adj[a].add(b)
-                    if b in adj:
-                        adj[b].add(a)
-
-                visited = {self.center}
-                frontier = {self.center}
-                for _ in range(self.depth):
-                    nxt = set()
-                    for v in frontier:
-                        nxt |= adj.get(v, set())
-                    nxt -= visited
-                    visited |= nxt
-                    frontier = nxt
-
-                nodes = sorted(visited, key=str.lower)
-                node_set = set(nodes)
-                edges = [(a, b) for (a, b) in edges_all if a in node_set and b in node_set]
-
-            # Suggest dynamic force-layout steps based on node count (reduce CPU on larger graphs)
-            # We still cap by self.max_steps.
-            n = max(1, len(nodes))
-            dyn_steps = int(min(self.max_steps, max(40, 20 + 10 * math.sqrt(n))))
-
-            dt_ms = (time.perf_counter() - t0) * 1000.0
-            payload = {
-                "nodes": nodes,
-                "edges": edges,
-                "stats": {
-                    "mode": self.mode,
-                    "depth": self.depth,
-                    "nodes_all": len(nodes_all),
-                    "edges_all": len(edges_all),
-                    "time_ms": dt_ms,
-                    "layout_steps": dyn_steps,
-                },
-                "layout_steps": dyn_steps,
-            }
-            self.signals.finished.emit(self.req_id, payload)
-        except Exception as e:
-            self.signals.failed.emit(self.req_id, str(e))
+        self.graph_service.request_build(
+            mode=self.graph_mode,
+            depth=self.graph_depth,
+            center=self.current_path.stem if self.current_path else None,
+            outgoing_snapshot={
+                k: list(v) for k, v in self._link_index.outgoing.items()
+            },
+            existing_titles=set(self._link_index.outgoing.keys())
+                            | set(self._link_index.incoming.keys()),
+            max_nodes=self.max_graph_nodes,
+            max_steps=self.max_graph_steps,
+            immediate=True,
+        )
 
 class GraphNode(QGraphicsEllipseItem):
     def __init__(self, title: str, x: float, y: float, degree: int, theme: dict, r_base: float = 10.0):
