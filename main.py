@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import QApplication
-from app import install_global_exception_hooks, NotesApp, APP_NAME, SESSION_ID, log
+from app_copy import install_global_exception_hooks, NotesApp, APP_NAME, SESSION_ID, log
 
 
 def main():
