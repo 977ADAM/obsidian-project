@@ -305,6 +305,13 @@ LOG_PATH = LOG_DIR / f"{APP_NAME}.log"
 
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger(APP_NAME)
+
+    # Log skipped autosaves explicitly (useful for race debugging)
+    def log_autosave_skip():
+        logger.info("Autosave skipped: note token mismatch (note was switched before timer fired)")
+
+    logger.log_autosave_skip = log_autosave_skip  # type: ignore
+
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
 
@@ -597,6 +604,16 @@ class NotesApp(QMainWindow):
         self.setWindowTitle("obsidian-project (Python)")
 
         # --- SETTINGS ---
+        class SettingsKeys:
+            UI_THEME = "ui/theme"
+            UI_GEOMETRY = "ui/geometry"
+            UI_STATE = "ui/windowState"
+            UI_SPLITTER = "ui/splitter_sizes"
+            UI_RIGHT_SPLITTER = "ui/right_splitter_sizes"
+            VAULT_DIR = "vault/dir"
+            LAST_NOTE = "nav/last_note"
+            GRAPH_MODE = "graph/mode"
+            GRAPH_DEPTH = "graph/depth"
         # Храним (и восстанавливаем) UI-состояние и пользовательские опции.
         # QSettings сам выберет корректное место под конкретную ОС.
         self._settings = QSettings(APP_NAME, APP_NAME)
@@ -606,8 +623,8 @@ class NotesApp(QMainWindow):
         self._settings_save_timer.timeout.connect(self._save_ui_state)
 
         # persisted options
-        self._theme = str(self._settings.value("ui/theme", "dark"))
-        self.graph_mode = str(self._settings.value("graph/mode", "global"))
+        self._theme = str(self._settings.value(SettingsKeys.UI_THEME, "dark"))
+        self.graph_mode = str(self._settings.value(SettingsKeys.GRAPH_MODE, "global"))
         try:
             self.graph_depth = int(self._settings.value("graph/depth", 1))
         except Exception:
@@ -624,8 +641,8 @@ class NotesApp(QMainWindow):
             self.max_graph_steps = 250
 
         # startup restore targets (vault + last note)
-        self._startup_vault_dir = str(self._settings.value("vault/dir", "")) or ""
-        self._startup_last_note = str(self._settings.value("nav/last_note", "")) or ""
+        self._startup_vault_dir = str(self._settings.value(SettingsKeys.VAULT_DIR, "")) or ""
+        self._startup_last_note = str(self._settings.value(SettingsKeys.LAST_NOTE, "")) or ""
 
         self.vault_dir: Path | None = None
         self.current_path: Path | None = None
@@ -1587,6 +1604,8 @@ class NotesApp(QMainWindow):
 
         if check_token and getattr(self, "_pending_save_token", None) != self._note_token:
             log.debug("Save skipped: note switched before timer fired")
+            if hasattr(log, "log_autosave_skip"):
+                log.log_autosave_skip()
             return False
 
         text = self.editor.toPlainText()
@@ -1815,6 +1834,12 @@ class _RenameRewriteWorker(QRunnable):
                     self.signals.progress.emit(self.req_id, done, total_files, p.name)
 
                     txt = p.read_text(encoding="utf-8")
+
+                    # --- BACKUP BEFORE REWRITE ---
+                    backup_path = p.with_suffix(p.suffix + ".bak")
+                    if not backup_path.exists():
+                        atomic_write_text(backup_path, txt, encoding="utf-8")
+
                     new_txt, changed = rewrite_wikilinks_targets(
                         txt,
                         old_stem=self.old_stem,
