@@ -32,7 +32,7 @@ class SessionAdapter(logging.LoggerAdapter):
         extra.setdefault("session", SESSION_ID)
         return msg, kwargs
 
-from PySide6.QtCore import Qt, QTimer, Signal, QPointF, QElapsedTimer, QObject, QRunnable, QThreadPool, Slot
+from PySide6.QtCore import Qt, QTimer, Signal, QPointF, QElapsedTimer, QObject, QRunnable, QThreadPool, Slot, QSettings
 from PySide6.QtGui import QAction, QPainter, QPen, QBrush, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -596,6 +596,37 @@ class NotesApp(QMainWindow):
         log.info("Приложение инициализировано")
         self.setWindowTitle("obsidian-project (Python)")
 
+        # --- SETTINGS ---
+        # Храним (и восстанавливаем) UI-состояние и пользовательские опции.
+        # QSettings сам выберет корректное место под конкретную ОС.
+        self._settings = QSettings(APP_NAME, APP_NAME)
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(400)
+        self._settings_save_timer.timeout.connect(self._save_ui_state)
+
+        # persisted options
+        self._theme = str(self._settings.value("ui/theme", "dark"))
+        self.graph_mode = str(self._settings.value("graph/mode", "global"))
+        try:
+            self.graph_depth = int(self._settings.value("graph/depth", 1))
+        except Exception:
+            self.graph_depth = 1
+
+        # --- GRAPH LIMITS / PERF (persisted) ---
+        try:
+            self.max_graph_nodes = int(self._settings.value("graph/max_nodes", 400))
+        except Exception:
+            self.max_graph_nodes = 400
+        try:
+            self.max_graph_steps = int(self._settings.value("graph/max_steps", 250))
+        except Exception:
+            self.max_graph_steps = 250
+
+        # startup restore targets (vault + last note)
+        self._startup_vault_dir = str(self._settings.value("vault/dir", "")) or ""
+        self._startup_last_note = str(self._settings.value("nav/last_note", "")) or ""
+
         self.vault_dir: Path | None = None
         self.current_path: Path | None = None
 
@@ -616,13 +647,6 @@ class NotesApp(QMainWindow):
         # Последняя сохранённая/загруженная версия текста текущей заметки.
         # Нужна, чтобы не терять изменения при переключении (даже если _dirty "не успел").
         self._last_saved_text: str = ""
-        self.graph_mode = "global"   # "global" | "local"
-        self.graph_depth = 1         # 1 или 2
-
-        # --- GRAPH LIMITS / PERF ---
-        # Prevent O(n^2) layout blowups on large vaults.
-        self.max_graph_nodes = 400
-        self.max_graph_steps = 250
 
         # UI
 
@@ -647,16 +671,16 @@ class NotesApp(QMainWindow):
         left_layout.addWidget(self.backlinks)
         self.backlinks.itemClicked.connect(lambda it: self.open_or_create_by_title(it.text()))
 
-        right = QSplitter(Qt.Vertical)
-        right.addWidget(self.editor)
-        right.addWidget(self.preview)
-        right.addWidget(self.graph)
-        right.setStretchFactor(0, 3)
-        right.setStretchFactor(1, 2)
-        right.setStretchFactor(2, 2)
+        self.right_splitter = QSplitter(Qt.Vertical)
+        self.right_splitter.addWidget(self.editor)
+        self.right_splitter.addWidget(self.preview)
+        self.right_splitter.addWidget(self.graph)
+        self.right_splitter.setStretchFactor(0, 3)
+        self.right_splitter.setStretchFactor(1, 2)
+        self.right_splitter.setStretchFactor(2, 2)
 
         self.splitter.addWidget(left)
-        self.splitter.addWidget(right)
+        self.splitter.addWidget(self.right_splitter)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 3)
 
@@ -665,6 +689,11 @@ class NotesApp(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.addWidget(self.splitter)
         self.setCentralWidget(root)
+
+        # restore UI state (window geometry/splitters) after widgets exist
+        self._restore_ui_state()
+        self.splitter.splitterMoved.connect(lambda *_: self._schedule_ui_state_save())
+        self.right_splitter.splitterMoved.connect(lambda *_: self._schedule_ui_state_save())
 
         # Autosave debounce
         self.save_timer = QTimer(self)
@@ -704,8 +733,12 @@ class NotesApp(QMainWindow):
         # Menu
         self._build_menu()
 
-        # Start: ask vault
-        self.choose_vault()
+        # Apply persisted view options now that actions exist.
+        self._apply_theme(self._theme, save=False)
+        self._apply_graph_mode(self.graph_mode, self.graph_depth, save=False)
+
+        # Start: try reopen last vault/note (fallback to picker).
+        self._startup_open()
 
     def _set_ui_busy(self, busy: bool) -> None:
         """
@@ -733,6 +766,147 @@ class NotesApp(QMainWindow):
         except Exception:
             pass
 
+    # ----------------- QSettings helpers -----------------
+    def _restore_ui_state(self) -> None:
+        try:
+            geo = self._settings.value("ui/geometry")
+            if geo:
+                self.restoreGeometry(geo)
+            else:
+                # default on first run
+                self.resize(1100, 700)
+
+            st = self._settings.value("ui/windowState")
+            if st:
+                self.restoreState(st)
+
+            s1 = self._settings.value("ui/splitter_sizes")
+            if s1:
+                try:
+                    self.splitter.setSizes([int(x) for x in s1])
+                except Exception:
+                    pass
+
+            s2 = self._settings.value("ui/right_splitter_sizes")
+            if s2 and hasattr(self, "right_splitter"):
+                try:
+                    self.right_splitter.setSizes([int(x) for x in s2])
+                except Exception:
+                    pass
+        except Exception:
+            log.exception("Failed to restore UI state from QSettings")
+
+    def _schedule_ui_state_save(self) -> None:
+        try:
+            self._settings_save_timer.start()
+        except Exception:
+            pass
+
+    def _save_ui_state(self) -> None:
+        try:
+            self._settings.setValue("ui/geometry", self.saveGeometry())
+            self._settings.setValue("ui/windowState", self.saveState())
+            self._settings.setValue("ui/splitter_sizes", self.splitter.sizes())
+            if hasattr(self, "right_splitter"):
+                self._settings.setValue("ui/right_splitter_sizes", self.right_splitter.sizes())
+        except Exception:
+            log.exception("Failed to save UI state to QSettings")
+
+    def _apply_theme(self, name: str, *, save: bool = True) -> None:
+        name = (name or "").strip().lower()
+        if name not in ("dark", "light"):
+            name = "dark"
+
+        self._theme = name
+
+        # keep menu state if actions exist
+        if hasattr(self, "_act_dark"):
+            self._act_dark.blockSignals(True)
+            self._act_light.blockSignals(True)
+            self._act_dark.setChecked(name == "dark")
+            self._act_light.setChecked(name == "light")
+            self._act_dark.blockSignals(False)
+            self._act_light.blockSignals(False)
+
+        try:
+            self.graph.apply_theme(name)
+            # перестроим граф, чтобы ноды пересоздались с новой темой
+            self.request_build_link_graph(immediate=True)
+            if self.current_path:
+                self.graph.highlight(self.current_path.stem)
+        except Exception:
+            log.exception("Failed to apply theme")
+
+        if save:
+            self._settings.setValue("ui/theme", name)
+
+    def _apply_graph_mode(self, mode: str, depth: int = 1, *, save: bool = True) -> None:
+        mode = (mode or "").strip().lower()
+        if mode not in ("global", "local"):
+            mode = "global"
+        try:
+            depth = int(depth)
+        except Exception:
+            depth = 1
+        depth = 2 if depth >= 2 else 1
+
+        self.graph_mode = mode
+        self.graph_depth = depth
+
+        if hasattr(self, "_act_graph_global"):
+            self._act_graph_global.setChecked(mode == "global")
+            self._act_graph_local1.setChecked(mode == "local" and depth == 1)
+            self._act_graph_local2.setChecked(mode == "local" and depth == 2)
+
+        try:
+            self.request_build_link_graph(immediate=True)
+            if self.current_path:
+                self.graph.highlight(self.current_path.stem)
+        except Exception:
+            log.exception("Failed to apply graph mode")
+
+        if save:
+            self._settings.setValue("graph/mode", mode)
+            self._settings.setValue("graph/depth", depth)
+
+    def _startup_open(self) -> None:
+        # try reopen vault
+        vault_path = Path(self._startup_vault_dir) if self._startup_vault_dir else None
+        if vault_path and vault_path.exists() and vault_path.is_dir():
+            self._open_vault_at(vault_path, save=True)
+        else:
+            self.choose_vault()
+
+        # open last note (if exists)
+        try:
+            if self.vault_dir and self._startup_last_note:
+                p = self.vault_dir / f"{safe_filename(self._startup_last_note)}.md"
+                if p.exists():
+                    self._open_note_no_history(p.stem)
+        except Exception:
+            log.exception("Failed to open last note on startup")
+
+    def _open_vault_at(self, vault_dir: Path, *, save: bool = True) -> None:
+        self.vault_dir = Path(vault_dir)
+        self.vault_dir.mkdir(parents=True, exist_ok=True)
+        log.info("Vault selected: %s", self.vault_dir)
+
+        if save:
+            self._settings.setValue("vault/dir", str(self.vault_dir))
+
+        self.current_path = None
+        self.editor.blockSignals(True)
+        self.editor.clear()
+        self.editor.blockSignals(False)
+        self._dirty = False
+        self._last_saved_text = ""
+        self._nav_back.clear()
+        self._nav_forward.clear()
+
+        self._rebuild_link_index()
+        self.refresh_list()
+        self.request_build_link_graph(immediate=True)
+
     def closeEvent(self, event):  # type: ignore[override]
         """
         Ensure last edits are persisted on window close.
@@ -741,6 +915,7 @@ class NotesApp(QMainWindow):
         try:
             self._stop_debounced_timers()
             self._flush_current_note_before_switch()
+            self._save_ui_state()
         except Exception:
             log.exception("Failed to flush note on close")
         super().closeEvent(event)
@@ -790,56 +965,35 @@ class NotesApp(QMainWindow):
 
         viewm = menubar.addMenu("Вид")
 
-        act_dark = QAction("Тема: Dark", self, checkable=True)
-        act_light = QAction("Тема: Light", self, checkable=True)
-        act_dark.setChecked(True)
+        self._act_dark = QAction("Тема: Dark", self, checkable=True)
+        self._act_light = QAction("Тема: Light", self, checkable=True)
+        self._act_dark.setChecked(self._theme == "dark")
+        self._act_light.setChecked(self._theme == "light")
 
-        def set_dark():
-            act_dark.setChecked(True); act_light.setChecked(False)
-            self.graph.apply_theme("dark")
-            # перестроим граф, чтобы ноды пересоздались с новой темой
-            self.request_build_link_graph(immediate=True)
-            if self.current_path:
-                self.graph.highlight(self.current_path.stem)
+        self._act_dark.triggered.connect(lambda: self._apply_theme("dark", save=True))
+        self._act_light.triggered.connect(lambda: self._apply_theme("light", save=True))
 
-        def set_light():
-            act_light.setChecked(True); act_dark.setChecked(False)
-            self.graph.apply_theme("light")
-            self.request_build_link_graph(immediate=True)
-            if self.current_path:
-                self.graph.highlight(self.current_path.stem)
-
-        act_dark.triggered.connect(set_dark)
-        act_light.triggered.connect(set_light)
-
-        viewm.addAction(act_dark)
-        viewm.addAction(act_light)
+        viewm.addAction(self._act_dark)
+        viewm.addAction(self._act_light)
 
         graphm = menubar.addMenu("Граф")
 
-        act_global = QAction("Global", self, checkable=True)
-        act_local1 = QAction("Local (1 hop)", self, checkable=True)
-        act_local2 = QAction("Local (2 hops)", self, checkable=True)
-        act_global.setChecked(True)
+        self._act_graph_global = QAction("Global", self, checkable=True)
+        self._act_graph_local1 = QAction("Local (1 hop)", self, checkable=True)
+        self._act_graph_local2 = QAction("Local (2 hops)", self, checkable=True)
 
-        def _set_mode(mode: str, depth: int = 1):
-            self.graph_mode = mode
-            self.graph_depth = depth
-            act_global.setChecked(mode == "global")
-            act_local1.setChecked(mode == "local" and depth == 1)
-            act_local2.setChecked(mode == "local" and depth == 2)
+        # init checked state from settings
+        self._act_graph_global.setChecked(self.graph_mode == "global")
+        self._act_graph_local1.setChecked(self.graph_mode == "local" and self.graph_depth == 1)
+        self._act_graph_local2.setChecked(self.graph_mode == "local" and self.graph_depth == 2)
 
-            self.request_build_link_graph(immediate=True)
-            if self.current_path:
-                self.graph.highlight(self.current_path.stem)
+        self._act_graph_global.triggered.connect(lambda: self._apply_graph_mode("global", 1, save=True))
+        self._act_graph_local1.triggered.connect(lambda: self._apply_graph_mode("local", 1, save=True))
+        self._act_graph_local2.triggered.connect(lambda: self._apply_graph_mode("local", 2, save=True))
 
-        act_global.triggered.connect(lambda: _set_mode("global", 1))
-        act_local1.triggered.connect(lambda: _set_mode("local", 1))
-        act_local2.triggered.connect(lambda: _set_mode("local", 2))
-
-        graphm.addAction(act_global)
-        graphm.addAction(act_local1)
-        graphm.addAction(act_local2)
+        graphm.addAction(self._act_graph_global)
+        graphm.addAction(self._act_graph_local1)
+        graphm.addAction(self._act_graph_local2)
 
     def open_quick_switcher(self):
         if self.vault_dir is None:
@@ -875,6 +1029,13 @@ class NotesApp(QMainWindow):
 
         self.current_path = path
         self._note_token = uuid.uuid4().hex
+
+        # persist last opened note
+        try:
+            self._settings.setValue("nav/last_note", title)
+        except Exception:
+            pass
+
         text = path.read_text(encoding="utf-8")
 
         self.editor.blockSignals(True)
@@ -928,29 +1089,13 @@ class NotesApp(QMainWindow):
                     return
 
                 tmp = Path.home() / f".{APP_NAME}" / "vault"
-                tmp.mkdir(parents=True, exist_ok=True)
-                self.vault_dir = tmp
                 log.warning("Хранилище не выбрано. Используется резервное хранилище=%s", tmp)
-                # индекс строим сразу (пусть даже пустой)
-                self._rebuild_link_index()
-                self.refresh_list()
+                self._open_vault_at(tmp, save=True)
             else:
                 log.info("Выбор хранилища отменён. Сохраняется хранилище=%s", self.vault_dir)
             return
 
-        self.vault_dir = Path(path)
-        self.vault_dir.mkdir(parents=True, exist_ok=True)
-        log.info("Vault selected: %s", self.vault_dir)
-        self.current_path = None
-        self.editor.blockSignals(True)
-        self.editor.clear()
-        self.editor.blockSignals(False)
-        self._dirty = False
-        self._last_saved_text = ""
-
-        self._rebuild_link_index()
-        self.refresh_list()
-        self.request_build_link_graph(immediate=True)
+        self._open_vault_at(Path(path), save=True)
 
     def _rebuild_link_index(self) -> None:
         if self.vault_dir is None:
@@ -2240,8 +2385,10 @@ class GraphView(QGraphicsView):
 def main():
     install_global_exception_hooks()
     app = QApplication([])
+    # Ensure QSettings uses stable org/app identifiers.
+    app.setOrganizationName(APP_NAME)
+    app.setApplicationName(APP_NAME)
     win = NotesApp()
-    win.resize(1100, 700)
     win.show()
     log.info("Приложение запущено, SID=%s", SESSION_ID)
     app.exec()
