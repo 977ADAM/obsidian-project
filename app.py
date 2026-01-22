@@ -1,5 +1,3 @@
-APP_NAME = "obsidian-project"
-
 import os
 import re
 import sys
@@ -17,21 +15,6 @@ from urllib.parse import quote, unquote
 from dataclasses import dataclass, field
 from datetime import datetime
 
-SESSION_ID = uuid.uuid4().hex[:8]
-
-class EnsureSessionFilter(logging.Filter):
-    """Гарантирует наличие record.session, чтобы Formatter не падал."""
-    def filter(self, record: logging.LogRecord) -> bool:
-        if not hasattr(record, "session"):
-            record.session = SESSION_ID
-        return True
-
-class SessionAdapter(logging.LoggerAdapter):
-    def process(self, msg, kwargs):
-        extra = kwargs.setdefault("extra", {})
-        extra.setdefault("session", SESSION_ID)
-        return msg, kwargs
-
 from PySide6.QtCore import Qt, QTimer, Signal, QPointF, QElapsedTimer, QObject, QRunnable, QThreadPool, Slot, QSettings
 from PySide6.QtGui import QAction, QPainter, QPen, QBrush, QColor
 from PySide6.QtWidgets import (
@@ -47,12 +30,17 @@ import markdown as md
 from filenames import safe_filename
 from wikilinks import rewrite_wikilinks_targets, wikilinks_to_html
 from links import LinkIndex
+from logging_setup import APP_NAME, LOG_PATH
 
 # --- HTML sanitization (for Markdown preview rendered in QWebEngine) ---
 try:
     import bleach  # pip install bleach
 except Exception:  # pragma: no cover
     bleach = None
+
+
+log = logging.getLogger(APP_NAME)
+
 
 # чтобы не спамить warning при отсутствии bleach
 _BLEACH_MISSING_WARNED = False
@@ -155,106 +143,6 @@ def write_recovery_copy(note_path: Path, text: str) -> Path:
     rec_path = RECOVERY_DIR / f"{stem}.recovery.{ts}.md"
     atomic_write_text(rec_path, text, encoding="utf-8")
     return rec_path
-
-# Путь логов лучше не в cwd: он нестабилен для GUI приложений.
-LOG_DIR = Path.home() / f".{APP_NAME}" / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_PATH = LOG_DIR / f"{APP_NAME}.log"
-
-def setup_logging() -> logging.Logger:
-    logger = logging.getLogger(APP_NAME)
-
-    # Log skipped autosaves explicitly (useful for race debugging)
-    def log_autosave_skip():
-        logger.info("Autosave skipped: note token mismatch (note was switched before timer fired)")
-
-    logger.log_autosave_skip = log_autosave_skip  # type: ignore
-
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = False
-
-    if logger.handlers:
-        # чтобы при повторном импорте/запуске не плодить хендлеры
-        return logger
-
-    fmt = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s | %(message)s | sid=%(session)s"
-    )
-    session_filter = EnsureSessionFilter()
-
-    # файл с ротацией
-    fh = RotatingFileHandler(
-        LOG_PATH,
-        maxBytes=2 * 1024 * 1024,   # 2MB
-        backupCount=5,
-        encoding="utf-8",
-    )
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
-    fh.addFilter(session_filter)
-
-    # консоль
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    ch.addFilter(session_filter)
-
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-
-    logger.info("Logging initialized. log_file=%s", LOG_PATH)
-    return logger
-
-_base_logger = setup_logging()
-log = SessionAdapter(_base_logger, {})
-
-def install_global_exception_hooks() -> None:
-    # python exceptions (в основном потоке)
-    def _excepthook(exc_type, exc, tb):
-        log.critical("Uncaught exception", exc_info=(exc_type, exc, tb))
-        # можно оставить дефолтное поведение
-        sys.__excepthook__(exc_type, exc, tb)
-
-    sys.excepthook = _excepthook
-
-    # Qt warnings/errors (qDebug/qWarning/etc.)
-    try:
-        from PySide6.QtCore import qInstallMessageHandler
-
-        def _qt_message_handler(mode, context, message):
-            # Поднимем полезный контекст: файл/строка/функция.
-            try:
-                file = getattr(context, "file", None)
-                line = getattr(context, "line", None)
-                func = getattr(context, "function", None)
-                where = f"{file}:{line} {func}" if file or line or func else "unknown"
-            except Exception:
-                where = "unknown"
-
-            # Примерная мапа уровней (не идеальна, но лучше чем всегда warning)
-            # QtMsgType: 0=Debug, 1=Warning, 2=Critical, 3=Fatal, 4=Info (зависит от Qt)
-            level = logging.WARNING
-            try:
-                m = int(mode)
-                if m == 0:
-                    level = logging.DEBUG
-                elif m == 4:
-                    level = logging.INFO
-                elif m == 2:
-                    level = logging.ERROR
-                elif m == 3:
-                    level = logging.CRITICAL
-                else:
-                    level = logging.WARNING
-            except Exception:
-                level = logging.WARNING
-
-            log.log(level, "Qt: %s | where=%s", message, where)
-
-        qInstallMessageHandler(_qt_message_handler)
-        log.info("Qt message handler installed")
-    except Exception:
-        log.exception("Failed to install Qt message handler")
 
 class _NoteInterceptPage(QWebEnginePage):
     """
@@ -2167,18 +2055,3 @@ class GraphView(QGraphicsView):
             for node in self.nodes.values():
                 node.label.setOpacity(self._lod_current)
             self._lod_timer.stop()
-
-def main():
-    install_global_exception_hooks()
-    app = QApplication([])
-    # Ensure QSettings uses stable org/app identifiers.
-    app.setOrganizationName(APP_NAME)
-    app.setApplicationName(APP_NAME)
-    win = NotesApp()
-    win.show()
-    log.info("Приложение запущено, SID=%s", SESSION_ID)
-    app.exec()
-
-
-if __name__ == "__main__":
-    main()
