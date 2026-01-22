@@ -26,6 +26,8 @@ from graph_worker import _GraphBuildWorker
 from filesystem import atomic_write_text, write_recovery_copy
 from quick_switcher import QuickSwitcherDialog
 from html_sanitizer import sanitize_rendered_html
+from navigation import NavigationController
+
 
 log = logging.getLogger(APP_NAME)
 
@@ -115,10 +117,8 @@ class NotesApp(QMainWindow):
         # --- LINK INDEX ---
         self._link_index = LinkIndex()
 
-        # ---- NAV HISTORY ----
-        self._nav_back: list[str] = []
-        self._nav_forward: list[str] = []
-        self._nav_suppress = False  # чтобы back/forward не писали сами себя в историю
+        # ---- NAVIGATION ----
+        self._nav = NavigationController(self._open_note_no_history)
 
         self._dirty = False
         self._pending_save_token: str = self._note_token
@@ -378,8 +378,9 @@ class NotesApp(QMainWindow):
         self.editor.blockSignals(False)
         self._dirty = False
         self._last_saved_text = ""
-        self._nav_back.clear()
-        self._nav_forward.clear()
+        # self._nav_back.clear()
+        # self._nav_forward.clear()
+        self._nav.clear()
 
         self._rebuild_link_index()
         self.refresh_list()
@@ -619,56 +620,17 @@ class NotesApp(QMainWindow):
             return
 
         title = safe_filename(title)
+
         current = self.current_path.stem if self.current_path else None
-        # avoid redundant open + history churn
         if current == title:
             return
-        log.debug("open_or_create_by_title: заголовок=%s подавлять=%s", title, self._nav_suppress)
-
-        # если это обычная навигация (не back/forward) — пишем историю
-        if not self._nav_suppress:
-            current = self.current_path.stem if self.current_path else None
-            if current and current != title:
-                self._nav_back.append(current)
-                self._nav_forward.clear()
-
-        self._open_note_no_history(title)
+        self._nav.open(title, reopen_current=current)
 
     def nav_back(self):
-        if not self._nav_back:
-            return
-        
-        log.debug("Навигация назад: стек=%s", self._nav_back)
-
-        current = self.current_path.stem if self.current_path else None
-        if current:
-            self._nav_forward.append(current)
-
-        title = self._nav_back.pop()
-
-        self._nav_suppress = True
-        try:
-            self._open_note_no_history(title)
-        finally:
-            self._nav_suppress = False
+        self._nav.back()
 
     def nav_forward(self):
-        if not self._nav_forward:
-            return
-        
-        log.debug("Навигация вперёд: стек=%s", self._nav_forward)
-
-        current = self.current_path.stem if self.current_path else None
-        if current:
-            self._nav_back.append(current)
-
-        title = self._nav_forward.pop()
-
-        self._nav_suppress = True
-        try:
-            self._open_note_no_history(title)
-        finally:
-            self._nav_suppress = False
+        self._nav.forward()
 
 
     def _select_in_list(self, title: str):
