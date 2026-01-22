@@ -14,12 +14,12 @@ import html
 from urllib.parse import unquote
 from datetime import datetime
 
-from app.core.filenames import safe_filename
-from app.core.wikilinks import wikilinks_to_html
-from app.core.links import LinkIndex
-from app.infrastructure.filesystem import atomic_write_text, write_recovery_copy
-from app.services.graph_service import GraphService
-from app.services.rename_service import RenameService
+from .core.filenames import safe_filename
+from .core.wikilinks import wikilinks_to_html
+from .core.links import LinkIndex
+from .infrastructure.filesystem import atomic_write_text, write_recovery_copy
+from .services.graph_service import GraphService
+from .services.rename_service import RenameService
 
 SESSION_ID = uuid.uuid4().hex[:8]
 
@@ -1189,6 +1189,65 @@ class NotesApp(QMainWindow):
             return False
 
         return True
+    
+    @Slot(int, int, int, str)
+    def _rename_progress_cb(self, req_id: int, done: int, total: int, filename: str):
+        if self._rename_progress is None:
+            self._rename_progress = QProgressDialog(
+                "Обновление ссылок…",
+                "Отмена",
+                0,
+                total,
+                self,
+            )
+            self._rename_progress.setWindowTitle("Переименование")
+            self._rename_progress.setMinimumDuration(0)
+            self._rename_progress.canceled.connect(self.rename_service.cancel)
+            self._set_ui_busy(True)
+
+        self._rename_progress.setMaximum(total)
+        self._rename_progress.setValue(done)
+        self._rename_progress.setLabelText(f"Файл: {filename}")
+
+    @Slot(int, dict, str, str)
+    def _rename_finished_cb(
+        self,
+        req_id: int,
+        result: dict,
+        old_stem: str,
+        new_stem: str,
+    ):
+        if self._rename_progress:
+            self._rename_progress.close()
+            self._rename_progress = None
+
+        self._set_ui_busy(False)
+
+        # обновляем состояние приложения
+        self.current_path = self.vault_dir / f"{new_stem}.md"
+        self._rebuild_link_index()
+        self.refresh_list()
+        self.refresh_backlinks()
+
+        QMessageBox.information(
+            self,
+            "Переименование",
+            f"Заметка «{old_stem}» переименована в «{new_stem}»",
+        )
+
+    @Slot(int, str)
+    def _rename_failed_cb(self, req_id: int, err: str):
+        if self._rename_progress:
+            self._rename_progress.close()
+            self._rename_progress = None
+
+        self._set_ui_busy(False)
+
+        QMessageBox.critical(
+            self,
+            "Ошибка переименования",
+            err,
+        )
 
     def save_now(
         self,
