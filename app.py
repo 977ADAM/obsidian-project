@@ -1,27 +1,16 @@
-import os
-import re
-import sys
-import unicodedata
 import uuid
 import logging
 import threading
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
-import math
-import random
 import time
-import html
-from urllib.parse import quote, unquote
-from dataclasses import dataclass, field
-from datetime import datetime
+from urllib.parse import unquote
 
-from PySide6.QtCore import Qt, QTimer, Signal, QPointF, QElapsedTimer, QObject, QRunnable, QThreadPool, Slot, QSettings
-from PySide6.QtGui import QAction, QPainter, QPen, QBrush, QColor
+from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, Slot, QSettings
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QTextEdit, QLineEdit, QFileDialog, QMessageBox, QSplitter,
-    QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsLineItem,
-    QGraphicsSimpleTextItem, QGraphicsItem, QDialog, QProgressDialog
+    QDialog, QProgressDialog
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
@@ -35,67 +24,10 @@ from logging_setup import APP_NAME, LOG_PATH
 from rename_worker import _RenameRewriteWorker
 from graph_worker import _GraphBuildWorker
 from filesystem import atomic_write_text, write_recovery_copy
-
-
-# --- HTML sanitization (for Markdown preview rendered in QWebEngine) ---
-try:
-    import bleach  # pip install bleach
-except Exception:  # pragma: no cover
-    bleach = None
-
+from quick_switcher import QuickSwitcherDialog
+from html_sanitizer import sanitize_rendered_html
 
 log = logging.getLogger(APP_NAME)
-
-
-# чтобы не спамить warning при отсутствии bleach
-_BLEACH_MISSING_WARNED = False
-
-ALLOWED_TAGS = [
-    "a", "p", "br", "hr",
-    "strong", "em", "code", "pre", "blockquote",
-    "ul", "ol", "li",
-    "h1", "h2", "h3", "h4", "h5", "h6",
-    "table", "thead", "tbody", "tr", "th", "td",
-    # If you want images, uncomment "img" and its attrs below.
-    # "img",
-]
-
-ALLOWED_ATTRS = {
-    "a": ["href", "title"],
-    "th": ["align"], "td": ["align"],
-    # Needed for markdown 'toc' extension anchors:
-    "h1": ["id"], "h2": ["id"], "h3": ["id"],
-    "h4": ["id"], "h5": ["id"], "h6": ["id"],
-    # "img": ["src", "alt", "title"],
-}
-
-ALLOWED_PROTOCOLS = ["http", "https", "mailto", "note"]
-
-def sanitize_rendered_html(rendered_html: str) -> str:
-    """
-    Sanitize HTML output from Markdown before feeding it to QWebEngine.
-    Without this, raw HTML inside notes can execute in the embedded browser.
-    """
-    if bleach is None:
-        # SAFE fallback: escape everything (loses formatting but prevents HTML/JS execution).
-        global _BLEACH_MISSING_WARNED
-        if not _BLEACH_MISSING_WARNED:
-            logging.getLogger(APP_NAME).warning(
-                "bleach is not installed; preview will be shown as plain text for safety. "
-                "Install 'bleach' to enable sanitized HTML rendering."
-            )
-            _BLEACH_MISSING_WARNED = True
-        return html.escape(rendered_html)
-
-    cleaned = bleach.clean(
-        rendered_html,
-        tags=ALLOWED_TAGS,
-        attributes=ALLOWED_ATTRS,
-        protocols=ALLOWED_PROTOCOLS,
-        strip=True,
-    )
-    # Also strip out any JS-able URLs that might slip through.
-    return cleaned
 
 class _NoteInterceptPage(QWebEnginePage):
     """
@@ -125,79 +57,6 @@ class LinkableWebView(QWebEngineView):
     def __init__(self):
         super().__init__()
         self.setPage(_NoteInterceptPage(self))
-
-class QuickSwitcherDialog(QDialog):
-    def __init__(self, parent, get_titles, on_open):
-        super().__init__(parent)
-        self.setWindowTitle("Quick Switcher")
-        self.setModal(True)
-        self.resize(520, 420)
-
-        self.get_titles = get_titles   # функция -> list[str]
-        self.on_open = on_open         # функция(title)
-
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("Введите название… (Enter — открыть/создать)")
-        self.listw = QListWidget()
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.input)
-        layout.addWidget(self.listw)
-
-        self._all = []
-        self._reload()
-
-        self.input.textChanged.connect(self._filter)
-        self.input.returnPressed.connect(self._open_current)
-        self.listw.itemActivated.connect(lambda it: self._open_title(it.text()))
-
-        # UX: сразу фокус в поле ввода
-        self.input.setFocus()
-
-    def _reload(self):
-        self._all = sorted(self.get_titles(), key=str.lower)
-        self._filter(self.input.text())
-
-    def _filter(self, text: str):
-        q = (text or "").strip().lower()
-        self.listw.clear()
-
-        if not q:
-            # когда пусто — показываем первые N (как "recent" упрощенно)
-            for t in self._all[:40]:
-                self.listw.addItem(t)
-            if self.listw.count():
-                self.listw.setCurrentRow(0)
-            return
-
-        # простое fuzzy-ish: сначала contains, потом startswith, потом остальные
-        contains = [t for t in self._all if q in t.lower()]
-        starts = [t for t in contains if t.lower().startswith(q)]
-        rest = [t for t in contains if t not in starts]
-        ranked = starts + rest
-
-        for t in ranked[:80]:
-            self.listw.addItem(t)
-
-        if self.listw.count():
-            self.listw.setCurrentRow(0)
-
-    def _open_current(self):
-        text = self.input.text().strip()
-        if not text:
-            return
-
-        cur = self.listw.currentItem()
-        if cur:
-            self._open_title(cur.text())
-            return
-
-        # если нет совпадений — создаём по введенному
-        self._open_title(text)
-
-    def _open_title(self, title: str):
-        self.on_open(title)
-        self.accept()
 
 class NotesApp(QMainWindow):
     def __init__(self):
