@@ -17,9 +17,9 @@ from datetime import datetime
 from app.core.filenames import safe_filename
 from app.core.wikilinks import wikilinks_to_html
 from app.core.links import LinkIndex
-from app.workers.rename_rewrite import RenameRewriteWorker
 from app.infrastructure.filesystem import atomic_write_text, write_recovery_copy
 from app.services.graph_service import GraphService
+from app.services.rename_service import RenameService
 
 SESSION_ID = uuid.uuid4().hex[:8]
 
@@ -447,10 +447,13 @@ class NotesApp(QMainWindow):
 
         # ---- RENAME REWRITE (background) ----
         self._rename_pool = QThreadPool.globalInstance()
-        self._rename_req_id = 0
-        self._rename_cancel_event: threading.Event | None = None
         self._rename_progress: QProgressDialog | None = None
-
+        self.rename_service = RenameService(
+            thread_pool=QThreadPool.globalInstance(),
+            on_progress=self._rename_progress_cb,
+            on_finished=self._rename_finished_cb,
+            on_failed=self._rename_failed_cb,
+        )
         # Signals
         self.search.textChanged.connect(self.refresh_list)
         self.listw.itemSelectionChanged.connect(self._on_select_note)
@@ -488,8 +491,7 @@ class NotesApp(QMainWindow):
                 self.save_timer.stop()
             if self.preview_timer.isActive():
                 self.preview_timer.stop()
-            if self._graph_debounce_timer.isActive():
-                self._graph_debounce_timer.stop()
+            # graph debounce lives in GraphService now
         except Exception:
             pass
 
@@ -1173,186 +1175,20 @@ class NotesApp(QMainWindow):
 
         # 3) Обновление ссылок по vault — ТЯЖЁЛОЕ, уводим в фон + прогресс
         # (UI обновим в колбэке по завершению)
-        self._start_rewrite_links_after_rename(old_stem=old_stem, new_stem=new_stem, new_path=new_path)
-        return True
-
-    def _start_rewrite_links_after_rename(self, *, old_stem: str, new_stem: str, new_path: Path) -> None:
-        """
-        Запускает массовый rewrite wikilinks в фоне.
-        На время операции делаем editor read-only и показываем прогресс.
-        """
-        if self.vault_dir is None:
-            return
-
-        # Если уже идёт операция — отменим/закроем прежний прогресс корректно.
-        try:
-            if self._rename_progress is not None:
-                self._rename_progress.reset()
-        except Exception:
-            pass
-
-        self._rename_req_id += 1
-        req_id = self._rename_req_id
-
-        self._rename_cancel_event = threading.Event()
-
-        # Список файлов снапшотом, чтобы worker не трогал UI/state
         files = sorted(self.vault_dir.glob("*.md"), key=lambda p: p.name.lower())
 
-        # Прогресс-диалог
-        dlg = QProgressDialog("Обновляю ссылки по хранилищу…", "Отмена", 0, max(1, len(files)), self)
-        dlg.setWindowTitle("Переименование: обновление ссылок")
-        dlg.setWindowModality(Qt.ApplicationModal)
-        dlg.setMinimumDuration(200)  # показывать не сразу, если всё очень быстро
-        dlg.setValue(0)
-
-        def on_cancel():
-            if self._rename_cancel_event is not None:
-                self._rename_cancel_event.set()
-            dlg.setLabelText("Отменяю… (дожидаюсь текущего файла)")
-
-        dlg.canceled.connect(on_cancel)
-        self._rename_progress = dlg
-
-        # На время операции — ограничим редактирование (уменьшаем риски гонок/конфликтов).
-        self._set_ui_busy(True)
-
-        worker = RenameRewriteWorker(
-            req_id=req_id,
+        ok, err = self.rename_service.start(
             vault_dir=self.vault_dir,
             files=files,
-            old_stem=old_stem,
-            new_stem=new_stem,
-            cancel_event=self._rename_cancel_event,
-        )
-        worker.signals.progress.connect(self._on_rename_rewrite_progress)
-        worker.signals.finished.connect(lambda rid, res: self._on_rename_rewrite_finished(rid, res, new_path=new_path))
-        worker.signals.failed.connect(self._on_rename_rewrite_failed)
-        self._rename_pool.start(worker)
-
-    @Slot(int, int, int, str)
-    def _on_rename_rewrite_progress(self, req_id: int, done: int, total: int, filename: str) -> None:
-        if req_id != self._rename_req_id:
-            return
-        dlg = self._rename_progress
-        if dlg is None:
-            return
-        try:
-            dlg.setMaximum(max(1, total))
-            dlg.setValue(min(done, total))
-            if filename:
-                dlg.setLabelText(f"Обновляю ссылки… {done}/{total}\n{filename}")
-        except Exception:
-            pass
-
-    def _finish_rename_ui_cleanup(self) -> None:
-        """Единая точка завершения: закрыть прогресс и вернуть UI."""
-        try:
-            if self._rename_progress is not None:
-                self._rename_progress.setValue(self._rename_progress.maximum())
-                self._rename_progress.close()
-        except Exception:
-            pass
-        self._rename_progress = None
-        self._rename_cancel_event = None
-        self._set_ui_busy(False)
-
-    def _on_rename_rewrite_finished(self, req_id: int, result: dict, *, new_path: Path) -> None:
-        if req_id != self._rename_req_id:
-            return
-        self._finish_rename_ui_cleanup()
-
-        changed_files = int(result.get("changed_files") or 0)
-        total_files = int(result.get("total_files") or 0)
-        error_files: list[str] = list(result.get("error_files") or [])
-        canceled = bool(result.get("canceled"))
-
-        log.info(
-            "Rename rewrite finished: total=%d changed=%d canceled=%s errors=%d",
-            total_files, changed_files, canceled, len(error_files),
+            old_title=old_stem,
+            new_title=new_stem,
         )
 
-        # 4) Re-open renamed note in UI (without creating history churn)
-        try:
-            # Если текущая заметка была переименована — переключим current_path на новый файл.
-            if self.current_path and self.current_path.stem == safe_filename(new_path.stem):
-                self.current_path = new_path
-            elif self.current_path and self.current_path.stem == safe_filename(result.get("old_stem") or ""):
-                self.current_path = new_path
-        except Exception:
-            pass
+        if not ok:
+            QMessageBox.warning(self, "Переименование", err)
+            return False
 
-        if self.current_path and self.current_path == new_path:
-            try:
-                text = new_path.read_text(encoding="utf-8")
-            except Exception:
-                text = self.editor.toPlainText()
-
-            self.editor.blockSignals(True)
-            self.editor.setPlainText(text)
-            self.editor.blockSignals(False)
-            self._dirty = False
-            self._last_saved_text = text
-            self._render_preview(text)
-
-        # 5) Rebuild link index (safe after mass edits) + refresh UI
-        try:
-            self._rebuild_link_index()
-        except Exception:
-            log.exception("Failed to rebuild link index after rename rewrite")
-
-        self.refresh_list()
-        self._select_in_list(new_path.stem)
-        self.graph_service.request_build(
-            mode=self.graph_mode,
-            depth=self.graph_depth,
-            center=self.current_path.stem if self.current_path else None,
-            outgoing_snapshot={
-                k: list(v) for k, v in self._link_index.outgoing.items()
-            },
-            existing_titles=set(self._link_index.outgoing.keys())
-                            | set(self._link_index.incoming.keys()),
-            max_nodes=self.max_graph_nodes,
-            max_steps=self.max_graph_steps,
-            immediate=True,
-        )
-        self.graph.highlight(new_path.stem)
-        self.graph.center_on(new_path.stem)
-        self.refresh_backlinks()
-
-        # Уведомление пользователю (не спамим, но даём знать про проблемы)
-        if canceled:
-            QMessageBox.information(
-                self,
-                "Переименование",
-                "Обновление ссылок было отменено.\n"
-                "Файл заметки переименован, но ссылки могли обновиться не везде.",
-            )
-        elif error_files:
-            # показываем только небольшую выборку, детали — в логах
-            sample = "\n".join(error_files[:12])
-            more = "" if len(error_files) <= 12 else f"\n… и ещё {len(error_files) - 12}"
-            QMessageBox.warning(
-                self,
-                "Переименование",
-                "Переименование выполнено, но часть файлов не удалось обновить.\n\n"
-                f"Проблемные файлы:\n{sample}{more}\n\n"
-                f"Детали — в логах: {LOG_PATH}",
-            )
-
-    @Slot(int, str)
-    def _on_rename_rewrite_failed(self, req_id: int, err: str) -> None:
-        if req_id != self._rename_req_id:
-            return
-        self._finish_rename_ui_cleanup()
-        log.warning("Rename rewrite failed (bg): %s", err)
-        QMessageBox.warning(
-            self,
-            "Переименование",
-            "Файл был переименован, но при обновлении ссылок произошла ошибка.\n\n"
-            f"{err}\n\n"
-            f"Детали — в логах: {LOG_PATH}",
-        )
+        return True
 
     def save_now(
         self,
