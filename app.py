@@ -9,7 +9,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QTextEdit, QLineEdit, QFileDialog, QMessageBox, QSplitter,
-    QDialog, QProgressDialog, QPushButton
+    QProgressDialog
 )
 
 from filenames import safe_filename
@@ -26,6 +26,17 @@ from app_settings import SettingsKeys, get_int, get_str
 from webview import LinkableWebView
 from ui_state import UiStateStore
 from ui_dialogs import ask_vault_cancel_action, build_rename_dialog
+from qt_utils import blocked_signals, safe_set_setting
+from app_helpers import (
+    AUTOSAVE_DEBOUNCE_MS,
+    PREVIEW_DEBOUNCE_MS_DEFAULT,
+    PREVIEW_DEBOUNCE_MS_MIN,
+    PREVIEW_DEBOUNCE_MS_MAX_ADD,
+    PREVIEW_DEBOUNCE_MS_CHARS_PER_STEP,
+    normalize_theme,
+    normalize_graph_mode,
+)
+from preview_timing import compute_preview_debounce_ms
 
 
 log = logging.getLogger(APP_NAME)
@@ -124,13 +135,13 @@ class NotesApp(QMainWindow):
 
         # Autosave debounce
         self.save_timer = QTimer(self)
-        self.save_timer.setInterval(600)  # мс
+        self.save_timer.setInterval(AUTOSAVE_DEBOUNCE_MS)  # мс
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self._save_current_if_needed)
 
         # Preview debounce (чтобы не рендерить markdown на каждый символ)
         self.preview_timer = QTimer(self)
-        self.preview_timer.setInterval(350)  # мс (дебаунс превью; дальше можем адаптировать)
+        self.preview_timer.setInterval(PREVIEW_DEBOUNCE_MS_DEFAULT)  # мс (дебаунс превью; дальше можем адаптировать)
         self.preview_timer.setSingleShot(True)
         self.preview_timer.timeout.connect(self._render_preview_from_editor)
 
@@ -168,6 +179,25 @@ class NotesApp(QMainWindow):
         # Start: try reopen last vault/note (fallback to picker).
         self._startup_open()
 
+    def _stop_timers_and_flush(self, *, reason: str) -> None:
+        """
+        Единая точка: остановить дебаунс-таймеры и сохранить текущую заметку,
+        чтобы не потерять изменения при смене контекста (vault/rename/close).
+        """
+        try:
+            self._stop_debounced_timers()
+            self._flush_current_note_before_switch()
+        except Exception:
+            log.exception("Failed to stop timers and flush (reason=%s)", reason)
+
+    def _compute_preview_debounce_ms(self, txt_len: int) -> int:
+        return compute_preview_debounce_ms(
+            txt_len,
+            min_ms=PREVIEW_DEBOUNCE_MS_MIN,
+            max_add_ms=PREVIEW_DEBOUNCE_MS_MAX_ADD,
+            chars_per_step=PREVIEW_DEBOUNCE_MS_CHARS_PER_STEP,
+            default_ms=PREVIEW_DEBOUNCE_MS_DEFAULT,
+        )
 
     # ----------------- Note I/O helpers -----------------
     def _note_path(self, title: str) -> Path:
@@ -190,11 +220,8 @@ class NotesApp(QMainWindow):
 
     def _set_editor_text(self, text: str) -> None:
         """Установка текста в редактор без триггера textChanged."""
-        self.editor.blockSignals(True)
-        try:
+        with blocked_signals(self.editor):
             self.editor.setPlainText(text)
-        finally:
-            self.editor.blockSignals(False)
 
     def _switch_to_note(self, *, path: Path, title: str) -> None:
         """
@@ -205,21 +232,14 @@ class NotesApp(QMainWindow):
           - load текст
           - обновить UI/state
         """
-        # 1) Остановим отложенные таймеры от предыдущей заметки
-        self._stop_debounced_timers()
-        # 2) Надёжно сохраним предыдущую заметку перед переключением
-        self._flush_current_note_before_switch()
-        # 3) Создадим файл при необходимости
+        self._stop_timers_and_flush(reason="switch_to_note")
         self._ensure_note_exists(path, title)
 
         self.current_path = path
         self._note_token = uuid.uuid4().hex
 
         # persist last opened note
-        try:
-            self._settings.setValue(SettingsKeys.LAST_NOTE, title)
-        except Exception:
-            pass
+        safe_set_setting(self._settings, SettingsKeys.LAST_NOTE, title)
 
         text = self._read_text(path)
         self._set_editor_text(text)
@@ -279,21 +299,17 @@ class NotesApp(QMainWindow):
                 act.blockSignals(False)
 
     def _apply_theme(self, name: str, *, save: bool = True) -> None:
-        name = (name or "").strip().lower()
-        if name not in ("dark", "light"):
-            name = "dark"
-
-        self._theme = name
+        self._theme = normalize_theme(name)
 
         # keep menu state if actions exist
         if hasattr(self, "_act_dark"):
             self._sync_action_checks({
-                self._act_dark: name == "dark",
-                self._act_light: name == "light",
+                self._act_dark: self._theme == "dark",
+                self._act_light: self._theme == "light",
             })
 
         try:
-            self.graph.apply_theme(name)
+            self.graph.apply_theme(self._theme)
             # перестроим граф, чтобы ноды пересоздались с новой темой
             self.request_build_link_graph(immediate=True)
             if self.current_path:
@@ -302,26 +318,18 @@ class NotesApp(QMainWindow):
             log.exception("Failed to apply theme")
 
         if save:
-            self._settings.setValue(SettingsKeys.UI_THEME, name)
+            safe_set_setting(self._settings, SettingsKeys.UI_THEME, self._theme)
 
     def _apply_graph_mode(self, mode: str, depth: int = 1, *, save: bool = True) -> None:
-        mode = (mode or "").strip().lower()
-        if mode not in ("global", "local"):
-            mode = "global"
-        try:
-            depth = int(depth)
-        except Exception:
-            depth = 1
-        depth = 2 if depth >= 2 else 1
-
-        self.graph_mode = mode
-        self.graph_depth = depth
+        mode_norm, depth_norm = normalize_graph_mode(mode, depth)
+        self.graph_mode = mode_norm
+        self.graph_depth = depth_norm
 
         if hasattr(self, "_act_graph_global"):
             self._sync_action_checks({
-                self._act_graph_global: mode == "global",
-                self._act_graph_local1: (mode == "local" and depth == 1),
-                self._act_graph_local2: (mode == "local" and depth == 2),
+                self._act_graph_global: self.graph_mode == "global",
+                self._act_graph_local1: (self.graph_mode == "local" and self.graph_depth == 1),
+                self._act_graph_local2: (self.graph_mode == "local" and self.graph_depth == 2),
             })
 
         try:
@@ -332,8 +340,8 @@ class NotesApp(QMainWindow):
             log.exception("Failed to apply graph mode")
 
         if save:
-            self._settings.setValue(SettingsKeys.GRAPH_MODE, mode)
-            self._settings.setValue(SettingsKeys.GRAPH_DEPTH, depth)
+            safe_set_setting(self._settings, SettingsKeys.GRAPH_MODE, self.graph_mode)
+            safe_set_setting(self._settings, SettingsKeys.GRAPH_DEPTH, self.graph_depth)
 
     def _startup_open(self) -> None:
         # try reopen vault
@@ -358,12 +366,11 @@ class NotesApp(QMainWindow):
         log.info("Vault selected: %s", self.vault_dir)
 
         if save:
-            self._settings.setValue(SettingsKeys.VAULT_DIR, str(self.vault_dir))
+            safe_set_setting(self._settings, SettingsKeys.VAULT_DIR, str(self.vault_dir))
 
         self.current_path = None
-        self.editor.blockSignals(True)
-        self.editor.clear()
-        self.editor.blockSignals(False)
+        with blocked_signals(self.editor):
+            self.editor.clear()
         self._dirty = False
         self._last_saved_text = ""
         self._nav.clear()
@@ -377,12 +384,11 @@ class NotesApp(QMainWindow):
         Ensure last edits are persisted on window close.
         Protects against data loss when autosave timer hasn't fired yet.
         """
+        self._stop_timers_and_flush(reason="closeEvent")
         try:
-            self._stop_debounced_timers()
-            self._flush_current_note_before_switch()
             self._ui_state.save()
         except Exception:
-            log.exception("Failed to flush note on close")
+            log.exception("Failed to save UI state on close")
         super().closeEvent(event)
 
     def resizeEvent(self, event):  # type: ignore[override]
@@ -502,12 +508,7 @@ class NotesApp(QMainWindow):
         log.info("Открылось диалоговое окно «Выбрать хранилище».")
 
         # IMPORTANT: don't lose unsaved edits when switching vaults.
-        # Stop timers first (autosave/preview/graph) then flush current note safely.
-        try:
-            self._stop_debounced_timers()
-            self._flush_current_note_before_switch()
-        except Exception:
-            log.exception("Failed to flush note before choosing vault")
+        self._stop_timers_and_flush(reason="choose_vault")
 
         path = QFileDialog.getExistingDirectory(self, "Выберите папку для заметок")
 
@@ -558,12 +559,11 @@ class NotesApp(QMainWindow):
         q = self.search.text().strip().lower()
         notes = self.list_notes()
 
-        self.listw.blockSignals(True)
-        self.listw.clear()
-        for p in notes:
-            if not q or q in p.stem.lower():
-                self.listw.addItem(p.stem)
-        self.listw.blockSignals(False)
+        with blocked_signals(self.listw):
+            self.listw.clear()
+            for p in notes:
+                if not q or q in p.stem.lower():
+                    self.listw.addItem(p.stem)
 
     def _on_select_note(self):
         items = self.listw.selectedItems()
@@ -589,7 +589,6 @@ class NotesApp(QMainWindow):
     def nav_forward(self):
         self._nav.forward()
 
-
     def _select_in_list(self, title: str):
         # Важно: setCurrentRow триггерит itemSelectionChanged -> _on_select_note -> open_or_create...
         # Поэтому на время выделения блокируем сигналы списка.
@@ -599,8 +598,7 @@ class NotesApp(QMainWindow):
                     return i
             return -1
 
-        self.listw.blockSignals(True)
-        try:
+        with blocked_signals(self.listw):
             row = find_row()
             if row >= 0:
                 self.listw.setCurrentRow(row)
@@ -611,8 +609,6 @@ class NotesApp(QMainWindow):
             row = find_row()
             if row >= 0:
                 self.listw.setCurrentRow(row)
-        finally:
-            self.listw.blockSignals(False)
 
     def _on_text_changed(self):
         self._dirty = True
@@ -620,9 +616,7 @@ class NotesApp(QMainWindow):
         self._pending_save_token = self._note_token
         # Не рендерим превью на каждый символ — дебаунсим (адаптивно под размер заметки).
         txt_len = len(self.editor.toPlainText())
-        # 300..800ms: большие заметки требуют более редкого рендера
-        interval = 300 + min(500, txt_len // 400)
-        self.preview_timer.setInterval(interval)
+        self.preview_timer.setInterval(self._compute_preview_debounce_ms(txt_len))
         self.preview_timer.start()
         self.save_timer.start()
 
@@ -685,11 +679,7 @@ class NotesApp(QMainWindow):
             return False
 
         # Make sure current edits are saved (robust)
-        try:
-            self._stop_debounced_timers()
-            self._flush_current_note_before_switch()
-        except Exception:
-            log.exception("Failed to flush before rename")
+        self._stop_timers_and_flush(reason="rename_note")
 
         log.info("Rename note: %s -> %s", old_stem, new_stem)
 
@@ -821,9 +811,8 @@ class NotesApp(QMainWindow):
             except Exception:
                 text = self.editor.toPlainText()
 
-            self.editor.blockSignals(True)
-            self.editor.setPlainText(text)
-            self.editor.blockSignals(False)
+            with blocked_signals(self.editor):
+                self.editor.setPlainText(text)
             self._dirty = False
             self._last_saved_text = text
             self._render_preview(text)

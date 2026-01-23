@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Literal
 
 from PySide6.QtWidgets import (
     QWidget,
@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 
-def ask_vault_cancel_action(parent: QWidget) -> str:
+def ask_vault_cancel_action(parent: QWidget) -> Literal["retry", "fallback", "exit"]:
     """
     Called when user cancels vault selection on first startup (no vault yet).
     Returns one of: 'retry', 'fallback', 'exit'.
