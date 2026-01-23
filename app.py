@@ -17,13 +17,15 @@ from links import LinkIndex
 from graph_view import GraphView
 from logging_setup import APP_NAME, LOG_PATH
 from rename_worker import _RenameRewriteWorker
-from graph_worker import _GraphBuildWorker
+from graph_controller import GraphController
 from filesystem import atomic_write_text, write_recovery_copy
 from quick_switcher import QuickSwitcherDialog
 from preview_renderer import render_preview_page
 from navigation import NavigationController
 from app_settings import SettingsKeys, get_int, get_str
 from webview import LinkableWebView
+from ui_state import UiStateStore
+from ui_dialogs import ask_vault_cancel_action, build_rename_dialog
 
 
 log = logging.getLogger(APP_NAME)
@@ -39,10 +41,7 @@ class NotesApp(QMainWindow):
         # Храним (и восстанавливаем) UI-состояние и пользовательские опции.
         # QSettings сам выберет корректное место под конкретную ОС.
         self._settings = QSettings(APP_NAME, APP_NAME)
-        self._settings_save_timer = QTimer(self)
-        self._settings_save_timer.setSingleShot(True)
-        self._settings_save_timer.setInterval(400)
-        self._settings_save_timer.timeout.connect(self._save_ui_state)
+        self._ui_state = UiStateStore(owner=self, settings=self._settings, debounce_ms=400)
 
         # persisted options
         self._theme = get_str(self._settings, SettingsKeys.UI_THEME, "dark")
@@ -119,9 +118,9 @@ class NotesApp(QMainWindow):
         self.setCentralWidget(root)
 
         # restore UI state (window geometry/splitters) after widgets exist
-        self._restore_ui_state()
-        self.splitter.splitterMoved.connect(lambda *_: self._schedule_ui_state_save())
-        self.right_splitter.splitterMoved.connect(lambda *_: self._schedule_ui_state_save())
+        self._ui_state.restore(splitter=self.splitter, right_splitter=self.right_splitter)
+        self.splitter.splitterMoved.connect(lambda *_: self._ui_state.schedule_save())
+        self.right_splitter.splitterMoved.connect(lambda *_: self._ui_state.schedule_save())
 
         # Autosave debounce
         self.save_timer = QTimer(self)
@@ -137,14 +136,15 @@ class NotesApp(QMainWindow):
 
         self._last_preview_source_text: str | None = None
 
-        # ---- GRAPH BUILD (background) ----
-        self._graph_pool = QThreadPool.globalInstance()
-        self._graph_req_id = 0  # monotonically increasing; used to drop stale results
-        # Debounce graph rebuild requests (avoid rebuilding on every autosave)
-        self._graph_debounce_timer = QTimer(self)
-        self._graph_debounce_timer.setInterval(1200)  # ms (tune as needed)
-        self._graph_debounce_timer.setSingleShot(True)
-        self._graph_debounce_timer.timeout.connect(self._request_build_link_graph_now)
+        # ---- GRAPH BUILD (moved to GraphController) ----
+        self._graph_ctrl = GraphController(
+            parent=self,
+            debounce_ms=1200,
+            get_context=self._graph_context_snapshot,
+            on_built=self._apply_graph_payload,
+            on_failed=self._on_graph_error,
+            logger=log,
+        )
 
         # ---- RENAME REWRITE (background) ----
         self._rename_pool = QThreadPool.globalInstance()
@@ -168,6 +168,73 @@ class NotesApp(QMainWindow):
         # Start: try reopen last vault/note (fallback to picker).
         self._startup_open()
 
+
+    # ----------------- Note I/O helpers -----------------
+    def _note_path(self, title: str) -> Path:
+        """
+        Строит путь к заметке по заголовку (без расширения в UI).
+        """
+        assert self.vault_dir is not None
+        # title здесь уже ожидается как stem (нормализованное имя)
+        return self.vault_dir / f"{title}.md"
+
+    def _ensure_note_exists(self, path: Path, title: str) -> None:
+        """Создаёт заметку на диске, если её нет."""
+        if path.exists():
+            return
+        atomic_write_text(path, f"# {title}\n\n", encoding="utf-8")
+
+    def _read_text(self, path: Path) -> str:
+        """Единая точка чтения заметки (можно позже добавить recovery/encoding fallback)."""
+        return path.read_text(encoding="utf-8")
+
+    def _set_editor_text(self, text: str) -> None:
+        """Установка текста в редактор без триггера textChanged."""
+        self.editor.blockSignals(True)
+        try:
+            self.editor.setPlainText(text)
+        finally:
+            self.editor.blockSignals(False)
+
+    def _switch_to_note(self, *, path: Path, title: str) -> None:
+        """
+        Единый сценарий переключения заметки (без истории):
+          - стоп таймеров предыдущей заметки
+          - flush предыдущих изменений
+          - ensure file exists
+          - load текст
+          - обновить UI/state
+        """
+        # 1) Остановим отложенные таймеры от предыдущей заметки
+        self._stop_debounced_timers()
+        # 2) Надёжно сохраним предыдущую заметку перед переключением
+        self._flush_current_note_before_switch()
+        # 3) Создадим файл при необходимости
+        self._ensure_note_exists(path, title)
+
+        self.current_path = path
+        self._note_token = uuid.uuid4().hex
+
+        # persist last opened note
+        try:
+            self._settings.setValue(SettingsKeys.LAST_NOTE, title)
+        except Exception:
+            pass
+
+        text = self._read_text(path)
+        self._set_editor_text(text)
+
+        self._dirty = False
+        self._last_saved_text = text
+
+        self._render_preview(text)
+        self._select_in_list(title)
+
+        self.request_build_link_graph(immediate=True)
+        self.graph.highlight(title)
+        self.graph.center_on(title)
+        self.refresh_backlinks()
+
     def _set_ui_busy(self, busy: bool) -> None:
         """
         Минимальная блокировка UI на время тяжёлых фоновых операций (mass rewrite).
@@ -180,65 +247,36 @@ class NotesApp(QMainWindow):
             self.editor.setReadOnly(busy)
             # меню оставляем, но можно расширить при желании
         except Exception:
-            pass
+            log.exception("Failed to toggle UI busy state (busy=%s)", busy)
 
     def _stop_debounced_timers(self) -> None:
         """Stop delayed autosave/preview/graph debounce timers (safe before switching context)."""
+        for t in (getattr(self, "save_timer", None), getattr(self, "preview_timer", None)):
+            try:
+                if t is not None and t.isActive():
+                    t.stop()
+            except Exception:
+                log.exception("Failed to stop timer: %r", t)
+        # graph debounce is inside controller now
         try:
-            if self.save_timer.isActive():
-                self.save_timer.stop()
-            if self.preview_timer.isActive():
-                self.preview_timer.stop()
-            if self._graph_debounce_timer.isActive():
-                self._graph_debounce_timer.stop()
+            if hasattr(self, "_graph_ctrl") and self._graph_ctrl is not None:
+                self._graph_ctrl.stop()
         except Exception:
-            pass
+            log.exception("Failed to stop graph controller")
 
-    # ----------------- QSettings helpers -----------------
-    def _restore_ui_state(self) -> None:
-        try:
-            geo = self._settings.value(SettingsKeys.UI_GEOMETRY)
-            if geo:
-                self.restoreGeometry(geo)
-            else:
-                # default on first run
-                self.resize(1100, 700)
-
-            st = self._settings.value(SettingsKeys.UI_STATE)
-            if st:
-                self.restoreState(st)
-
-            s1 = self._settings.value(SettingsKeys.UI_SPLITTER)
-            if s1:
-                try:
-                    self.splitter.setSizes([int(x) for x in s1])
-                except Exception:
-                    pass
-
-            s2 = self._settings.value(SettingsKeys.UI_RIGHT_SPLITTER)
-            if s2 and hasattr(self, "right_splitter"):
-                try:
-                    self.right_splitter.setSizes([int(x) for x in s2])
-                except Exception:
-                    pass
-        except Exception:
-            log.exception("Failed to restore UI state from QSettings")
-
-    def _schedule_ui_state_save(self) -> None:
-        try:
-            self._settings_save_timer.start()
-        except Exception:
-            pass
-
-    def _save_ui_state(self) -> None:
-        try:
-            self._settings.setValue(SettingsKeys.UI_GEOMETRY, self.saveGeometry())
-            self._settings.setValue(SettingsKeys.UI_STATE, self.saveState())
-            self._settings.setValue(SettingsKeys.UI_SPLITTER, self.splitter.sizes())
-            if hasattr(self, "right_splitter"):
-                self._settings.setValue(SettingsKeys.UI_RIGHT_SPLITTER, self.right_splitter.sizes())
-        except Exception:
-            log.exception("Failed to save UI state to QSettings")
+    def _sync_action_checks(self, mapping: dict[QAction, bool]) -> None:
+        """
+        Единая точка синхронизации checked-state для QAction.
+        Полезно, чтобы не ловить лишние signal-циклы.
+        """
+        for act, checked in mapping.items():
+            if act is None:
+                continue
+            try:
+                act.blockSignals(True)
+                act.setChecked(bool(checked))
+            finally:
+                act.blockSignals(False)
 
     def _apply_theme(self, name: str, *, save: bool = True) -> None:
         name = (name or "").strip().lower()
@@ -249,12 +287,10 @@ class NotesApp(QMainWindow):
 
         # keep menu state if actions exist
         if hasattr(self, "_act_dark"):
-            self._act_dark.blockSignals(True)
-            self._act_light.blockSignals(True)
-            self._act_dark.setChecked(name == "dark")
-            self._act_light.setChecked(name == "light")
-            self._act_dark.blockSignals(False)
-            self._act_light.blockSignals(False)
+            self._sync_action_checks({
+                self._act_dark: name == "dark",
+                self._act_light: name == "light",
+            })
 
         try:
             self.graph.apply_theme(name)
@@ -282,9 +318,11 @@ class NotesApp(QMainWindow):
         self.graph_depth = depth
 
         if hasattr(self, "_act_graph_global"):
-            self._act_graph_global.setChecked(mode == "global")
-            self._act_graph_local1.setChecked(mode == "local" and depth == 1)
-            self._act_graph_local2.setChecked(mode == "local" and depth == 2)
+            self._sync_action_checks({
+                self._act_graph_global: mode == "global",
+                self._act_graph_local1: (mode == "local" and depth == 1),
+                self._act_graph_local2: (mode == "local" and depth == 2),
+            })
 
         try:
             self.request_build_link_graph(immediate=True)
@@ -342,10 +380,26 @@ class NotesApp(QMainWindow):
         try:
             self._stop_debounced_timers()
             self._flush_current_note_before_switch()
-            self._save_ui_state()
+            self._ui_state.save()
         except Exception:
             log.exception("Failed to flush note on close")
         super().closeEvent(event)
+
+    def resizeEvent(self, event):  # type: ignore[override]
+        # сохраняем геометрию окна (debounced)
+        try:
+            self._ui_state.schedule_save()
+        except Exception:
+            pass
+        super().resizeEvent(event)
+
+    def moveEvent(self, event):  # type: ignore[override]
+        # сохраняем позицию окна (debounced)
+        try:
+            self._ui_state.schedule_save()
+        except Exception:
+            pass
+        super().moveEvent(event)
 
     def _build_menu(self):
         menubar = self.menuBar()
@@ -438,46 +492,11 @@ class NotesApp(QMainWindow):
         if self.vault_dir is None:
             return
 
-        title = safe_filename(title)
-        path = self.vault_dir / f"{title}.md"
-        log.info("Открытая заметка (без истории): заголовок=%s путь=%s", title, path)
+        stem = safe_filename(title)
+        path = self._note_path(stem)
+        log.info("Открытая заметка (без истории): stem=%s путь=%s", stem, path)
 
-        # --- FIX: остановим отложенные таймеры от предыдущей заметки ---
-        # Иначе таймер мог "стрельнуть" после смены current_path и сохранить/отрендерить не то.
-        self._stop_debounced_timers()
-
-        # Надёжно сохраняем предыдущую заметку перед переключением.
-        # Не полагаемся только на _dirty: сравниваем текст фактически.
-        self._flush_current_note_before_switch()
-
-        if not path.exists():
-            log.info("Примечание не существует, создаём: %s", path)
-            atomic_write_text(path, f"# {title}\n\n", encoding="utf-8")
-
-        self.current_path = path
-        self._note_token = uuid.uuid4().hex
-
-        # persist last opened note
-        try:
-            self._settings.setValue(SettingsKeys.LAST_NOTE, title)
-        except Exception:
-            pass
-
-        text = path.read_text(encoding="utf-8")
-
-        self.editor.blockSignals(True)
-        self.editor.setPlainText(text)
-        self.editor.blockSignals(False)
-
-        self._dirty = False
-        self._last_saved_text = text
-        self._render_preview(text)
-        self._select_in_list(title)
-
-        self.request_build_link_graph(immediate=True)
-        self.graph.highlight(title)
-        self.graph.center_on(title)
-        self.refresh_backlinks()
+        self._switch_to_note(path=path, title=stem)
 
     def choose_vault(self):
         log.info("Открылось диалоговое окно «Выбрать хранилище».")
@@ -496,22 +515,12 @@ class NotesApp(QMainWindow):
             # Пользователь отменил выбор папки
             if self.vault_dir is None:
                 # Дадим явный выбор, чтобы не создавать папки "молча"
-                msg = QMessageBox(self)
-                msg.setIcon(QMessageBox.Warning)
-                msg.setWindowTitle("Хранилище не выбрано")
-                msg.setText("Вы не выбрали папку для заметок.")
-                msg.setInformativeText("Как поступить?")
-                btn_retry = msg.addButton("Выбрать папку ещё раз", QMessageBox.AcceptRole)
-                btn_fallback = msg.addButton("Использовать резервную папку", QMessageBox.DestructiveRole)
-                btn_exit = msg.addButton("Выйти", QMessageBox.RejectRole)
-                msg.setDefaultButton(btn_retry)
-                msg.exec()
 
-                clicked = msg.clickedButton()
-                if clicked == btn_retry:
+                action = ask_vault_cancel_action(self)
+                if action == "retry":
                     return self.choose_vault()
 
-                if clicked == btn_exit:
+                if action == "exit":
                     QApplication.instance().quit()
                     return
 
@@ -584,19 +593,24 @@ class NotesApp(QMainWindow):
     def _select_in_list(self, title: str):
         # Важно: setCurrentRow триггерит itemSelectionChanged -> _on_select_note -> open_or_create...
         # Поэтому на время выделения блокируем сигналы списка.
+        def find_row() -> int:
+            for i in range(self.listw.count()):
+                if self.listw.item(i).text() == title:
+                    return i
+            return -1
+
         self.listw.blockSignals(True)
         try:
-            # выделяем в списке (если есть)
-            for i in range(self.listw.count()):
-                if self.listw.item(i).text() == title:
-                    self.listw.setCurrentRow(i)
-                    return
-            # если не было — добавим и выделим
+            row = find_row()
+            if row >= 0:
+                self.listw.setCurrentRow(row)
+                return
+
+            # если не было — обновим список и попробуем ещё раз
             self.refresh_list()
-            for i in range(self.listw.count()):
-                if self.listw.item(i).text() == title:
-                    self.listw.setCurrentRow(i)
-                    return
+            row = find_row()
+            if row >= 0:
+                self.listw.setCurrentRow(row)
         finally:
             self.listw.blockSignals(False)
 
@@ -632,57 +646,11 @@ class NotesApp(QMainWindow):
             return
 
         old_stem = self.current_path.stem
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Переименовать заметку")
-        dlg.setModal(True)
-        dlg.resize(520, 140)
-
-        layout = QVBoxLayout(dlg)
-
-        info = QTextEdit()
-        info.setReadOnly(True)
-        info.setMaximumHeight(60)
-        info.setPlainText(
-            "Введите новое имя заметки.\n"
-            "Будет переименован файл и обновлены ссылки вида [[...]] во всём хранилище."
+        dlg = build_rename_dialog(
+            self,
+            old_stem=old_stem,
+            on_rename=lambda old, new: self.rename_note(old_title=old, new_title=new),
         )
-        layout.addWidget(info)
-
-        inp = QLineEdit()
-        inp.setPlaceholderText("Новое имя…")
-        inp.setText(old_stem)
-        inp.selectAll()
-        layout.addWidget(inp)
-
-        # Enter в инпуте = применить
-        def do_accept() -> None:
-            new_title = inp.text().strip()
-            if not new_title:
-                QMessageBox.warning(self, "Переименование", "Имя не может быть пустым.")
-                return
-            ok = self.rename_note(old_title=old_stem, new_title=new_title)
-            if ok:
-                dlg.accept()
-
-        def do_reject() -> None:
-            dlg.reject()
-
-        inp.returnPressed.connect(do_accept)
-        dlg.finished.connect(lambda _: None)
-
-
-        dlg_buttons = QHBoxLayout()
-        btn_cancel = QPushButton("Отмена")
-        btn_ok = QPushButton("Переименовать")
-        btn_ok.setDefault(True)
-        btn_cancel.clicked.connect(do_reject)
-        btn_ok.clicked.connect(do_accept)
-        dlg_buttons.addStretch(1)
-        dlg_buttons.addWidget(btn_cancel)
-        dlg_buttons.addWidget(btn_ok)
-        layout.addLayout(dlg_buttons)
-
         dlg.exec()
 
     def rename_note(self, old_title: str, new_title: str) -> bool:
@@ -1019,75 +987,43 @@ class NotesApp(QMainWindow):
         self.open_or_create_by_title(title)
 
     def request_build_link_graph(self, immediate: bool = False):
-        """
-        Build graph off the UI thread; debounce by default to avoid rebuilding on every autosave.
-        Use immediate=True when user action expects instant rebuild (theme/mode/vault/open).
-        """
+        """Backwards-compatible API: теперь прокидываем в GraphController."""
         if self.vault_dir is None:
             return
-        if immediate:
-            if self._graph_debounce_timer.isActive():
-                self._graph_debounce_timer.stop()
-            self._request_build_link_graph_now()
-        else:
-            # restart debounce window
-            self._graph_debounce_timer.start()
+        self._graph_ctrl.request(immediate=immediate)
 
-    def _request_build_link_graph_now(self):
-        """Build graph off the UI thread; apply result when ready (drops stale results)."""
+    def _graph_context_snapshot(self) -> dict | None:
+        """Снапшот входных данных для графа (controller вызывает это в UI потоке)."""
         if self.vault_dir is None:
-            return
-
-        self._graph_req_id += 1
-        req_id = self._graph_req_id
-
-        # snapshot inputs (so background thread doesn't touch mutable UI state)
+            return None
         vault_dir = self.vault_dir
-        mode = self.graph_mode
-        depth = int(self.graph_depth)
         center = self.current_path.stem if self.current_path else None
-
-        # snapshot index so worker doesn't touch UI state
         outgoing_snapshot: dict[str, list[str]] = {
-            src: sorted(dsts)
-            for src, dsts in self._link_index.outgoing.items()
+            src: sorted(dsts) for src, dsts in self._link_index.outgoing.items()
         }
-        # real notes on disk
         existing_titles = {p.stem for p in vault_dir.glob("*.md")}
+        return {
+            "vault_dir": vault_dir,
+            "mode": self.graph_mode,
+            "depth": int(self.graph_depth),
+            "center": center,
+            "outgoing_snapshot": outgoing_snapshot,
+            "existing_titles": existing_titles,
+            "max_nodes": int(self.max_graph_nodes),
+            "max_steps": int(self.max_graph_steps),
+        }
 
-        worker = _GraphBuildWorker(
-            req_id=req_id,
-            vault_dir=vault_dir,
-            mode=mode,
-            depth=depth,
-            center=center,
-            outgoing_snapshot=outgoing_snapshot,
-            existing_titles=existing_titles,
-            max_nodes=int(self.max_graph_nodes),
-            max_steps=int(self.max_graph_steps),
-        )
-        worker.signals.finished.connect(self._on_graph_built)
-        worker.signals.failed.connect(self._on_graph_build_failed)
-        self._graph_pool.start(worker)
-
-    @Slot(int, dict)
-    def _on_graph_built(self, req_id: int, payload: dict):
-        # Drop stale results (user navigated/saved again while worker was running)
-        if req_id != self._graph_req_id:
-            return
-
+    def _apply_graph_payload(self, payload: dict) -> None:
+        """UI-применение результата графа (остаётся в NotesApp)."""
         nodes = payload["nodes"]
         edges = payload["edges"]
         stats = payload.get("stats", {})
-        # pass dynamic layout steps to GraphView (UI thread)
         try:
             self.graph._layout_steps = int(payload.get("layout_steps") or stats.get("layout_steps") or 250)
         except Exception:
             self.graph._layout_steps = 250
 
         self.graph.build(nodes, edges)
-
-        # keep highlight centered on current note if any
         if self.current_path:
             cur = self.current_path.stem
             self.graph.highlight(cur)
@@ -1101,10 +1037,7 @@ class NotesApp(QMainWindow):
             stats.get("time_ms", -1.0),
         )
 
-    @Slot(int, str)
-    def _on_graph_build_failed(self, req_id: int, err: str):
-        if req_id != self._graph_req_id:
-            return
+    def _on_graph_error(self, err: str) -> None:
         log.warning("Graph build failed (bg): %s", err)
 
     # Backwards-compatible alias (optional): keep old name used elsewhere

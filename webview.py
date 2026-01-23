@@ -6,6 +6,8 @@ from PySide6.QtCore import Signal
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
+__all__ = ["LinkableWebView"]
+
 
 class _NoteInterceptPage(QWebEnginePage):
     """
