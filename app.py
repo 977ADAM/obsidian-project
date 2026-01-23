@@ -3,17 +3,14 @@ import logging
 import threading
 from pathlib import Path
 import time
-from urllib.parse import unquote
 
-from PySide6.QtCore import Qt, QTimer, Signal, QThreadPool, Slot, QSettings
+from PySide6.QtCore import Qt, QTimer, QThreadPool, Slot, QSettings
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QTextEdit, QLineEdit, QFileDialog, QMessageBox, QSplitter,
     QDialog, QProgressDialog, QPushButton
 )
-from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWebEngineCore import QWebEnginePage
 
 from filenames import safe_filename
 from links import LinkIndex
@@ -26,39 +23,11 @@ from quick_switcher import QuickSwitcherDialog
 from preview_renderer import render_preview_page
 from navigation import NavigationController
 from app_settings import SettingsKeys, get_int, get_str
+from webview import LinkableWebView
 
 
 log = logging.getLogger(APP_NAME)
 
-
-class _NoteInterceptPage(QWebEnginePage):
-    """
-    Правильный перехват навигации: не даём QWebEngine реально "переходить"
-    на note://..., а просто эмитим сигнал во view.
-    """
-    def __init__(self, view: "LinkableWebView"):
-        super().__init__(view)
-        self._view = view
-
-    def acceptNavigationRequest(self, url, nav_type, isMainFrame):  # type: ignore[override]
-        if isMainFrame and url.scheme() == "note":
-            # Важно: для ссылок вида note://Title Qt кладёт "Title" в host(),
-            # а path() может быть пустым. Для note:///Title — наоборот.
-            raw = (url.path() or "").lstrip("/")
-            if not raw:
-                raw = url.host() or ""
-            title = unquote(raw).strip()
-            self._view.linkClicked.emit(title)
-            return False  # блокируем реальную навигацию
-        return super().acceptNavigationRequest(url, nav_type, isMainFrame)
-
-
-class LinkableWebView(QWebEngineView):
-    linkClicked = Signal(str)
-
-    def __init__(self):
-        super().__init__()
-        self.setPage(_NoteInterceptPage(self))
 
 class NotesApp(QMainWindow):
     def __init__(self):
