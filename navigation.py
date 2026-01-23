@@ -123,6 +123,36 @@ class NavigationController:
         self._current = new_current
         return True
 
+    def rename_title(self, old_title: str, new_title: str) -> None:
+        """
+        Обновить историю (back/forward/current) при переименовании заметки.
+        Ничего не открывает, только меняет сохранённые заголовки.
+        """
+        old_n = self._normalize_title(old_title)
+        new_n = self._normalize_title(new_title)
+        if not old_n or not new_n or old_n == new_n:
+            return
+
+        def _replace_in_deque(d: deque[str]) -> None:
+            if not d:
+                return
+            items = list(d)
+            changed = False
+            for i, t in enumerate(items):
+                if t == old_n:
+                    items[i] = new_n
+                    changed = True
+            if changed:
+                # сохраняем maxlen (read-only) через создание нового deque
+                new_d = deque(items, maxlen=d.maxlen)
+                d.clear()
+                d.extend(new_d)
+
+        if self._current == old_n:
+            self._current = new_n
+        _replace_in_deque(self._back)
+        _replace_in_deque(self._forward)
+
     def clear(self) -> None:
         self._back.clear()
         self._forward.clear()

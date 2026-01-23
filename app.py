@@ -10,14 +10,12 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QListWidget, QTextEdit, QLineEdit, QFileDialog, QMessageBox, QSplitter,
-    QDialog, QProgressDialog
+    QDialog, QProgressDialog, QPushButton
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
-import markdown as md
 from filenames import safe_filename
-from wikilinks import wikilinks_to_html
 from links import LinkIndex
 from graph_view import GraphView
 from logging_setup import APP_NAME, LOG_PATH
@@ -25,11 +23,13 @@ from rename_worker import _RenameRewriteWorker
 from graph_worker import _GraphBuildWorker
 from filesystem import atomic_write_text, write_recovery_copy
 from quick_switcher import QuickSwitcherDialog
-from html_sanitizer import sanitize_rendered_html
+from preview_renderer import render_preview_page
 from navigation import NavigationController
+from app_settings import SettingsKeys, get_int, get_str
 
 
 log = logging.getLogger(APP_NAME)
+
 
 class _NoteInterceptPage(QWebEnginePage):
     """
@@ -67,16 +67,6 @@ class NotesApp(QMainWindow):
         self.setWindowTitle("obsidian-project (Python)")
 
         # --- SETTINGS ---
-        class SettingsKeys:
-            UI_THEME = "ui/theme"
-            UI_GEOMETRY = "ui/geometry"
-            UI_STATE = "ui/windowState"
-            UI_SPLITTER = "ui/splitter_sizes"
-            UI_RIGHT_SPLITTER = "ui/right_splitter_sizes"
-            VAULT_DIR = "vault/dir"
-            LAST_NOTE = "nav/last_note"
-            GRAPH_MODE = "graph/mode"
-            GRAPH_DEPTH = "graph/depth"
         # Храним (и восстанавливаем) UI-состояние и пользовательские опции.
         # QSettings сам выберет корректное место под конкретную ОС.
         self._settings = QSettings(APP_NAME, APP_NAME)
@@ -86,26 +76,17 @@ class NotesApp(QMainWindow):
         self._settings_save_timer.timeout.connect(self._save_ui_state)
 
         # persisted options
-        self._theme = str(self._settings.value(SettingsKeys.UI_THEME, "dark"))
-        self.graph_mode = str(self._settings.value(SettingsKeys.GRAPH_MODE, "global"))
-        try:
-            self.graph_depth = int(self._settings.value("graph/depth", 1))
-        except Exception:
-            self.graph_depth = 1
+        self._theme = get_str(self._settings, SettingsKeys.UI_THEME, "dark")
+        self.graph_mode = get_str(self._settings, SettingsKeys.GRAPH_MODE, "global")
+        self.graph_depth = get_int(self._settings, SettingsKeys.GRAPH_DEPTH, 1)
 
         # --- GRAPH LIMITS / PERF (persisted) ---
-        try:
-            self.max_graph_nodes = int(self._settings.value("graph/max_nodes", 400))
-        except Exception:
-            self.max_graph_nodes = 400
-        try:
-            self.max_graph_steps = int(self._settings.value("graph/max_steps", 250))
-        except Exception:
-            self.max_graph_steps = 250
+        self.max_graph_nodes = get_int(self._settings, SettingsKeys.GRAPH_MAX_NODES, 400)
+        self.max_graph_steps = get_int(self._settings, SettingsKeys.GRAPH_MAX_STEPS, 250)
 
         # startup restore targets (vault + last note)
-        self._startup_vault_dir = str(self._settings.value(SettingsKeys.VAULT_DIR, "")) or ""
-        self._startup_last_note = str(self._settings.value(SettingsKeys.LAST_NOTE, "")) or ""
+        self._startup_vault_dir = get_str(self._settings, SettingsKeys.VAULT_DIR, "") or ""
+        self._startup_last_note = get_str(self._settings, SettingsKeys.LAST_NOTE, "") or ""
 
         self.vault_dir: Path | None = None
         self.current_path: Path | None = None
@@ -247,25 +228,25 @@ class NotesApp(QMainWindow):
     # ----------------- QSettings helpers -----------------
     def _restore_ui_state(self) -> None:
         try:
-            geo = self._settings.value("ui/geometry")
+            geo = self._settings.value(SettingsKeys.UI_GEOMETRY)
             if geo:
                 self.restoreGeometry(geo)
             else:
                 # default on first run
                 self.resize(1100, 700)
 
-            st = self._settings.value("ui/windowState")
+            st = self._settings.value(SettingsKeys.UI_STATE)
             if st:
                 self.restoreState(st)
 
-            s1 = self._settings.value("ui/splitter_sizes")
+            s1 = self._settings.value(SettingsKeys.UI_SPLITTER)
             if s1:
                 try:
                     self.splitter.setSizes([int(x) for x in s1])
                 except Exception:
                     pass
 
-            s2 = self._settings.value("ui/right_splitter_sizes")
+            s2 = self._settings.value(SettingsKeys.UI_RIGHT_SPLITTER)
             if s2 and hasattr(self, "right_splitter"):
                 try:
                     self.right_splitter.setSizes([int(x) for x in s2])
@@ -282,11 +263,11 @@ class NotesApp(QMainWindow):
 
     def _save_ui_state(self) -> None:
         try:
-            self._settings.setValue("ui/geometry", self.saveGeometry())
-            self._settings.setValue("ui/windowState", self.saveState())
-            self._settings.setValue("ui/splitter_sizes", self.splitter.sizes())
+            self._settings.setValue(SettingsKeys.UI_GEOMETRY, self.saveGeometry())
+            self._settings.setValue(SettingsKeys.UI_STATE, self.saveState())
+            self._settings.setValue(SettingsKeys.UI_SPLITTER, self.splitter.sizes())
             if hasattr(self, "right_splitter"):
-                self._settings.setValue("ui/right_splitter_sizes", self.right_splitter.sizes())
+                self._settings.setValue(SettingsKeys.UI_RIGHT_SPLITTER, self.right_splitter.sizes())
         except Exception:
             log.exception("Failed to save UI state to QSettings")
 
@@ -316,7 +297,7 @@ class NotesApp(QMainWindow):
             log.exception("Failed to apply theme")
 
         if save:
-            self._settings.setValue("ui/theme", name)
+            self._settings.setValue(SettingsKeys.UI_THEME, name)
 
     def _apply_graph_mode(self, mode: str, depth: int = 1, *, save: bool = True) -> None:
         mode = (mode or "").strip().lower()
@@ -344,8 +325,8 @@ class NotesApp(QMainWindow):
             log.exception("Failed to apply graph mode")
 
         if save:
-            self._settings.setValue("graph/mode", mode)
-            self._settings.setValue("graph/depth", depth)
+            self._settings.setValue(SettingsKeys.GRAPH_MODE, mode)
+            self._settings.setValue(SettingsKeys.GRAPH_DEPTH, depth)
 
     def _startup_open(self) -> None:
         # try reopen vault
@@ -370,7 +351,7 @@ class NotesApp(QMainWindow):
         log.info("Vault selected: %s", self.vault_dir)
 
         if save:
-            self._settings.setValue("vault/dir", str(self.vault_dir))
+            self._settings.setValue(SettingsKeys.VAULT_DIR, str(self.vault_dir))
 
         self.current_path = None
         self.editor.blockSignals(True)
@@ -378,8 +359,6 @@ class NotesApp(QMainWindow):
         self.editor.blockSignals(False)
         self._dirty = False
         self._last_saved_text = ""
-        # self._nav_back.clear()
-        # self._nav_forward.clear()
         self._nav.clear()
 
         self._rebuild_link_index()
@@ -511,7 +490,7 @@ class NotesApp(QMainWindow):
 
         # persist last opened note
         try:
-            self._settings.setValue("nav/last_note", title)
+            self._settings.setValue(SettingsKeys.LAST_NOTE, title)
         except Exception:
             pass
 
@@ -672,33 +651,7 @@ class NotesApp(QMainWindow):
         if getattr(self, "_last_preview_source_text", None) == text:
             return
         self._last_preview_source_text = text
-        # wiki links -> html links, потом markdown -> html
-        text2 = wikilinks_to_html(text)
-        rendered = md.markdown(
-            text2,
-            extensions=["fenced_code", "tables", "toc"]
-        )
-
-        # sanitize HTML (защита от <script>, onerror, javascript: и т.п.)
-        rendered = sanitize_rendered_html(rendered)
-
-        # простой стиль
-        page = f"""
-        <html>
-        <head>
-            <meta charset="utf-8"/>
-            <style>
-                body {{ font-family: sans-serif; padding: 16px; line-height: 1.5; }}
-                code, pre {{ background: #f5f5f5; }}
-                pre {{ padding: 12px; overflow-x: auto; }}
-                a {{ text-decoration: none; }}
-                a:hover {{ text-decoration: underline; }}
-            </style>
-        </head>
-        <body>{rendered}</body>
-        </html>
-        """
-        self.preview.setHtml(page)
+        self.preview.setHtml(render_preview_page(text))
 
     def rename_current_note_dialog(self):
         """
@@ -733,20 +686,8 @@ class NotesApp(QMainWindow):
         inp.selectAll()
         layout.addWidget(inp)
 
-        btns = QHBoxLayout()
-        b_ok = QAction("OK", dlg)  # placeholder action (we'll use buttons via QMessageBox-like)
-
-        # Use QMessageBox-style buttons for simplicity
-        msg = QMessageBox(dlg)
-        msg.setWindowTitle("Переименовать")
-        msg.setText("Нажмите OK, чтобы применить переименование.")
-        # But we want the line edit in dialog, not in QMessageBox.
-        # We'll implement simple accept/reject via key events.
-        #
-        # Instead: use standard dialog buttons via QDialogButtonBox (not imported).
-        # To avoid adding imports, we handle Enter/Esc directly.
-
-        def do_accept():
+        # Enter в инпуте = применить
+        def do_accept() -> None:
             new_title = inp.text().strip()
             if not new_title:
                 QMessageBox.warning(self, "Переименование", "Имя не может быть пустым.")
@@ -755,20 +696,14 @@ class NotesApp(QMainWindow):
             if ok:
                 dlg.accept()
 
-        def do_reject():
+        def do_reject() -> None:
             dlg.reject()
 
         inp.returnPressed.connect(do_accept)
         dlg.finished.connect(lambda _: None)
 
-        # Add simple buttons using QMessageBox instance (less code than QDialogButtonBox import)
-        mb = QMessageBox(dlg)
-        # We won't show mb; we only reuse its buttons concept? Not possible cleanly.
-        # We'll create real QPushButton without import? It's in QtWidgets; but not imported.
-        # Easiest: import QPushButton and build minimal buttons.
 
         dlg_buttons = QHBoxLayout()
-        from PySide6.QtWidgets import QPushButton
         btn_cancel = QPushButton("Отмена")
         btn_ok = QPushButton("Переименовать")
         btn_ok.setDefault(True)
@@ -829,12 +764,8 @@ class NotesApp(QMainWindow):
             QMessageBox.critical(self, "Переименование", f"Не удалось переименовать файл:\n{e}")
             return False
 
-        # 2) Update nav history stacks
-        try:
-            self._nav_back = [new_stem if t == old_stem else t for t in self._nav_back]
-            self._nav_forward = [new_stem if t == old_stem else t for t in self._nav_forward]
-        except Exception:
-            pass
+        # 2) Update navigation history (back/forward/current) for renamed title
+        self._nav.rename_title(old_stem, new_stem)
 
         # 3) Обновление ссылок по vault — ТЯЖЁЛОЕ, уводим в фон + прогресс
         # (UI обновим в колбэке по завершению)
