@@ -32,8 +32,12 @@ class NoteCatalog:
         self.by_title.clear()
         self.by_path.clear()
 
-    def rebuild(self, vault_dir: Path) -> None:
+    def rebuild(self, vault_dir: Path, *, migrate_to_id_paths: bool = False) -> None:
         self.clear()
+        notes_dir = Path(vault_dir) / "_notes"
+        if migrate_to_id_paths:
+            notes_dir.mkdir(parents=True, exist_ok=True)
+
         for path in vault_dir.rglob("*.md"):
             try:
                 text = read_note_text(path)
@@ -59,6 +63,23 @@ class NoteCatalog:
 
             if not note_id:
                 continue
+
+
+            # Optional migration: make filesystem path depend ONLY on note_id.
+            # Target: vault/_notes/<note_id>.md
+            if migrate_to_id_paths:
+                try:
+                    target = notes_dir / f"{note_id}.md"
+                    # Don't touch already-migrated file
+                    if path.resolve() != target.resolve():
+                        # Avoid overwriting if something already exists at destination
+                        if not target.exists():
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            path.replace(target)
+                            path = target
+                except Exception:
+                    # Best-effort: if migration fails, keep original path
+                    pass
 
             effective_title = (title or path.stem).strip() or path.stem
             info = NoteInfo(note_id=note_id, title=effective_title, path=path)

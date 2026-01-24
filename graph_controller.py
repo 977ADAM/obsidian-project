@@ -77,7 +77,7 @@ class GraphController(QObject):
             depth=ctx["depth"],
             center=ctx["center"],
             outgoing_snapshot=ctx["outgoing_snapshot"],
-            existing_titles=ctx["existing_titles"],
+            existing_ids=ctx["existing_ids"],
             max_nodes=ctx["max_nodes"],
             max_steps=ctx["max_steps"],
         )

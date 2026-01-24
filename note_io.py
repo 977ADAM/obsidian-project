@@ -139,20 +139,37 @@ def ensure_note_has_id(path: Path) -> str:
 
 def note_path(vault_dir: Path, stem: str) -> Path:
     """
-    Строит путь к заметке по stem (без расширения в UI).
-    Важно: stem уже должен быть нормализован (safe_filename).
+    LEGACY: строит путь к заметке по stem (т.е. по title/filename).
+    В note_id-модели путь должен зависеть только от note_id:
+      vault/_notes/<note_id>.md
     """
-    return vault_dir / f"{stem}.md"
+    raise RuntimeError(
+        "note_path() is legacy. Use vault/_notes/<note_id>.md and NoteCatalog.get(note_id).path"
+    )
 
 
 def ensure_note_exists(path: Path, title: str) -> None:
     """Создаёт заметку на диске, если её нет."""
     if path.exists():
         return
-    # старый API оставляем, но пишем уже "правильный" шаблон с note_id/title
+    atomic_write_text(path, build_new_note_text(title=title, note_id=generate_note_id()), encoding="utf-8")
+
+
+def ensure_note_exists_with_id(path: Path, *, note_id: str, title: str) -> None:
+    """
+    note_id-model:
+      - если файла нет, создаём его с ЗАДАННЫМ note_id
+    """
+    if path.exists():
+        return
+    note_id = (note_id or "").strip()
+    if not note_id:
+        # fallback на старое поведение
+        ensure_note_exists(path, title)
+        return
     atomic_write_text(
         path,
-        build_new_note_text(title=title, note_id=generate_note_id()),
+        build_new_note_text(title=title, note_id=note_id),
         encoding="utf-8",
     )
 

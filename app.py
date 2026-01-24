@@ -24,7 +24,14 @@ from webview import LinkableWebView
 from ui_state import UiStateStore
 from ui_dialogs import ask_vault_cancel_action, build_rename_dialog
 from qt_utils import blocked_signals, safe_set_setting
-from note_io import ensure_note_exists, read_note_text, set_editor_text, generate_note_id, build_new_note_text
+from note_io import (
+    ensure_note_exists,
+    ensure_note_exists_with_id,
+    read_note_text,
+    set_editor_text,
+    generate_note_id,
+    build_new_note_text,
+)
 from note_catalog import NoteCatalog
 from rename_controller import RenameRewriteController
 from app_helpers import (
@@ -81,7 +88,8 @@ class NotesApp(QMainWindow):
         self._catalog = NoteCatalog()
 
         # ---- NAVIGATION ----
-        self._nav = NavigationController(lambda nid: (self.open_by_id(nid) or True))
+        # ВАЖНО: callback не должен снова писать в историю, иначе рекурсия.
+        self._nav = NavigationController(lambda nid: (self._open_by_id_no_history(nid) or True))
 
         self._dirty = False
         self._pending_save_token: str = self._note_token
@@ -92,7 +100,7 @@ class NotesApp(QMainWindow):
         # UI
 
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Поиск… (по имени файла)")
+        self.search.setPlaceholderText("Поиск… (по заголовку заметки)")
         self.listw = QListWidget()
         self.backlinks = QListWidget()
         self.backlinks.setMinimumHeight(120)
@@ -209,7 +217,8 @@ class NotesApp(QMainWindow):
           - обновить UI/state
         """
         self._stop_timers_and_flush(reason="switch_to_note")
-        ensure_note_exists(path, title)
+        # note_id-модель: если файл отсутствует, создаём его с тем же note_id
+        ensure_note_exists_with_id(path, note_id=note_id, title=title)
 
         self.current_path = path
         self.current_note_id = note_id
@@ -371,7 +380,9 @@ class NotesApp(QMainWindow):
         if self.vault_dir is None:
             self._catalog.clear()
             return
-        self._catalog.rebuild(self.vault_dir)
+        # Ensure title is decoupled from filesystem path:
+        # migrate all notes to vault/_notes/<note_id>.md (best-effort).
+        self._catalog.rebuild(self.vault_dir, migrate_to_id_paths=True)
 
     def closeEvent(self, event):  # type: ignore[override]
         """
@@ -539,7 +550,7 @@ class NotesApp(QMainWindow):
         dt_ms = (time.perf_counter() - t0) * 1000.0
         log.info(
             "Link index rebuilt: notes=%d incoming_keys=%d outgoing_keys=%d time_ms=%.1f",
-            len(list(self.vault_dir.rglob("*.md"))),
+            len(self._catalog.by_id),
             len(self._link_index.incoming),
             len(self._link_index.outgoing),
             dt_ms,
@@ -605,12 +616,16 @@ class NotesApp(QMainWindow):
         # 2) Fallback: treat as title
         return self.open_or_create_by_title(ref)
 
-    def open_by_id(self, note_id: str) -> None:
+    def _open_by_id_no_history(self, note_id: str) -> None:
+        """Открыть заметку, НЕ трогая историю навигации (используется NavigationController)."""
         info = self._catalog.get(note_id)
         if not info:
             return
-        # navigation теперь должна хранить note_id (отдельный шаг, но можно начать тут)
         self._switch_to_note(note_id=note_id, path=info.path, title=info.title)
+
+    def open_by_id(self, note_id: str) -> None:
+        """Публичное открытие: открываем и коммитим в историю."""
+        self._open_by_id_no_history(note_id)
         try:
             self._nav.open(note_id, reopen_current=False)
         except Exception:
@@ -625,7 +640,7 @@ class NotesApp(QMainWindow):
         if not path.exists():
             atomic_write_text(path, build_new_note_text(title=title, note_id=nid), encoding="utf-8")
         # обновим каталог (точечно)
-        self._catalog.rebuild(self.vault_dir)
+        self._catalog.rebuild(self.vault_dir, migrate_to_id_paths=True)
         self.open_by_id(nid)
 
     def nav_back(self):
@@ -890,14 +905,14 @@ class NotesApp(QMainWindow):
         outgoing_snapshot: dict[str, list[str]] = {
             src: sorted(dsts) for src, dsts in self._link_index.outgoing.items()
         }
-        existing_titles = set(self._catalog.by_id.keys())
+        existing_ids = set(self._catalog.by_id.keys())
         return {
             "vault_dir": vault_dir,
             "mode": self.graph_mode,
             "depth": int(self.graph_depth),
             "center": center,
             "outgoing_snapshot": outgoing_snapshot,
-            "existing_titles": existing_titles,
+            "existing_ids": existing_ids,
             "max_nodes": int(self.max_graph_nodes),
             "max_steps": int(self.max_graph_steps),
         }

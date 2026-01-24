@@ -18,7 +18,7 @@ class _GraphBuildWorker(QRunnable):
         depth: int,
         center: str | None,
         outgoing_snapshot: dict[str, list[str]],
-        existing_titles: set[str],
+        existing_ids: set[str],
         max_nodes: int = 400,
         max_steps: int = 250,
     ):
@@ -29,7 +29,7 @@ class _GraphBuildWorker(QRunnable):
         self.depth = max(1, int(depth))
         self.center = center
         self.outgoing_snapshot = outgoing_snapshot
-        self.existing_titles = existing_titles
+        self.existing_ids = existing_ids
         self.max_nodes = max(50, int(max_nodes))
         self.max_steps = max(30, int(max_steps))
         self.signals = _GraphBuildSignals()
@@ -38,7 +38,7 @@ class _GraphBuildWorker(QRunnable):
         t0 = time.perf_counter()
         try:
             # Build from snapshot (fast, no disk IO)
-            title_set = set(self.existing_titles)
+            title_set = set(self.existing_ids)
             edges_all: list[tuple[str, str]] = []
 
             for src, dst_list in self.outgoing_snapshot.items():
