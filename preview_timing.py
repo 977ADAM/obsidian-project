@@ -11,9 +11,13 @@ def compute_preview_debounce_ms(
     Larger notes => render less frequently.
     """
     try:
+        if txt_len < 0 or min_ms < 0 or max_add_ms < 0:
+            return default_ms
         if chars_per_step <= 0:
             return default_ms
+
         steps = txt_len // chars_per_step
-        return min_ms + min(max_add_ms, steps)
+        add_ms = min(max_add_ms, steps * min_ms)
+        return min_ms + add_ms
     except Exception:
         return default_ms

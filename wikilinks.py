@@ -112,8 +112,24 @@ def wikilinks_to_html(markdown_text: str) -> str:
         target, alias = _split_alias(inner)
         label = alias if alias is not None else target
 
-        canonical = safe_filename(target)
-        href = "note://" + quote(canonical, safe="")
+        # Handle Obsidian-like suffixes:
+        #   [[Note#Heading]]  -> note://Note#Heading  (fragment)
+        #   [[Note^block]]    -> note://Note#^block   (fragment)
+        base, suffix = _split_suffix(target)
+
+        canonical_base = safe_filename(base)
+        href = "note://" + quote(canonical_base, safe="")
+
+        # Preserve heading/block as URL fragment so the interceptor does NOT treat it
+        # as part of the note title (prevents creating "Note#Heading" / "Note^block" notes).
+        if suffix:
+            if suffix.startswith("#"):
+                frag = suffix[1:]
+                href += "#" + quote(frag, safe="")
+            elif suffix.startswith("^"):
+                # Put block id into fragment too; keep leading '^' for future handling.
+                frag = suffix
+                href += "#" + quote(frag, safe="")
 
         return f'<a href="{href}">{html.escape(label, quote=False)}</a>'
 

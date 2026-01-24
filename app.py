@@ -554,7 +554,7 @@ class NotesApp(QMainWindow):
         current = self.current_path.stem if self.current_path else None
         if current == title:
             return
-        self._nav.open(title, reopen_current=current)
+        self._nav.open(title, reopen_current=False)
 
     def nav_back(self):
         self._nav.back()
@@ -669,7 +669,7 @@ class NotesApp(QMainWindow):
 
         # 3) Обновление ссылок по vault — ТЯЖЁЛОЕ, уводим в фон + прогресс
         # (UI обновим в колбэке по завершению)
-        self._start_rewrite_links_after_rename(old_stem=old_stem, new_stem=new_stem, new_path=new_path)
+        self._rename.start(old_stem=old_stem, new_stem=new_stem, new_path=new_path)
         return True
 
     def save_now(
