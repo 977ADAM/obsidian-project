@@ -25,10 +25,12 @@ class NoteCatalog:
     def __init__(self) -> None:
         self.by_id: Dict[str, NoteInfo] = {}
         self.by_title: Dict[str, str] = {}  # canonical title -> note_id
+        self.by_path: Dict[Path, str] = {}  # path -> note_id
 
     def clear(self) -> None:
         self.by_id.clear()
         self.by_title.clear()
+        self.by_path.clear()
 
     def rebuild(self, vault_dir: Path) -> None:
         self.clear()
@@ -61,10 +63,14 @@ class NoteCatalog:
             effective_title = (title or path.stem).strip() or path.stem
             info = NoteInfo(note_id=note_id, title=effective_title, path=path)
             self.by_id[note_id] = info
+            self.by_path[path] = note_id
 
             canon = safe_filename(effective_title)
             if canon and canon not in self.by_title:
                 self.by_title[canon] = note_id
+
+    def path_to_id(self, path: Path) -> Optional[str]:
+        return self.by_path.get(Path(path))
 
     def resolve_title(self, title: str) -> Optional[str]:
         canon = safe_filename(title)

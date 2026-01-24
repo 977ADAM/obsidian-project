@@ -13,6 +13,50 @@ _NOTE_ID_RE = re.compile(r"(?m)^\s*note_id\s*:\s*(.+?)\s*$")
 _TITLE_RE = re.compile(r"(?m)^\s*title\s*:\s*(.+?)\s*$")
 _H1_RE = re.compile(r"(?m)^\s*#\s+(.+?)\s*$")
 
+def set_note_title_in_text(text: str, *, new_title: str) -> tuple[str, bool]:
+    """
+    Best-effort update:
+      - YAML frontmatter: title:
+      - first H1: "# ..."
+    Returns (new_text, changed).
+    """
+    new_title = (new_title or "").strip()
+    if not new_title:
+        return text, False
+    if not text:
+        # if empty, build a fresh note skeleton
+        return build_new_note_text(title=new_title, note_id=generate_note_id()), True
+
+    changed = False
+    out = text
+
+    m = _FM_RE.match(out)
+    if m:
+        fm = m.group(1) or ""
+        if _TITLE_RE.search(fm):
+            fm2 = _TITLE_RE.sub(f"title: {new_title}", fm, count=1)
+        else:
+            fm2 = fm.rstrip() + f"\ntitle: {new_title}\n"
+        if fm2 != fm:
+            out = _FM_RE.sub(lambda _: f"---\n{fm2}\n---\n", out, count=1)
+            changed = True
+    else:
+        # no frontmatter: prepend
+        nid, _ = parse_note_meta(out)
+        nid2 = nid or generate_note_id()
+        out = build_new_note_text(title=new_title, note_id=nid2) + out
+        changed = True
+
+    # Update first H1 if present (optional but nice)
+    mh1 = _H1_RE.search(out)
+    if mh1:
+        out2 = _H1_RE.sub(f"# {new_title}", out, count=1)
+        if out2 != out:
+            out = out2
+            changed = True
+
+    return out, changed
+
 
 def generate_note_id() -> str:
     # короткий, но достаточно уникальный для vault; при желании можно UUID целиком

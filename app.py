@@ -293,8 +293,8 @@ class NotesApp(QMainWindow):
             self.graph.apply_theme(self._theme)
             # перестроим граф, чтобы ноды пересоздались с новой темой
             self.request_build_link_graph(immediate=True)
-            if self.current_path:
-                self.graph.highlight(self.current_path.stem)
+            if self.current_note_id:
+                self.graph.highlight(self.current_note_id)
         except Exception:
             log.exception("Failed to apply theme")
 
@@ -315,8 +315,8 @@ class NotesApp(QMainWindow):
 
         try:
             self.request_build_link_graph(immediate=True)
-            if self.current_path:
-                self.graph.highlight(self.current_path.stem)
+            if self.current_note_id:
+                self.graph.highlight(self.current_note_id)
         except Exception:
             log.exception("Failed to apply graph mode")
 
@@ -546,11 +546,7 @@ class NotesApp(QMainWindow):
         )
 
     def _path_to_id(self, path: Path) -> str | None:
-        # best-effort: catalog already built, but keep it safe
-        for nid, info in self._catalog.by_id.items():
-            if info.path == path:
-                return nid
-        return None
+        return self._catalog.path_to_id(path)
 
     def list_notes(self) -> list[str]:
         # return note_ids sorted by title
@@ -668,7 +664,15 @@ class NotesApp(QMainWindow):
             QMessageBox.information(self, "Переименование", "Сначала откройте заметку.")
             return
 
-        old_stem = self.current_path.stem
+        # Переименование в новой модели = смена title (файл по note_id не трогаем)
+        old_stem = ""
+        if self.current_note_id:
+            info = self._catalog.get(self.current_note_id)
+            if info:
+                old_stem = info.title
+        if not old_stem:
+            old_stem = "Untitled"
+
         dlg = build_rename_dialog(
             self,
             old_stem=old_stem,
@@ -684,48 +688,44 @@ class NotesApp(QMainWindow):
         if self.vault_dir is None:
             return False
 
-        old_stem = safe_filename(old_title)
-        new_stem = safe_filename(new_title)
+        if self.vault_dir is None or self.current_path is None or not self.current_note_id:
+            return False
 
-        if not old_stem or not new_stem:
+        old_canon = safe_filename(old_title)
+        new_canon = safe_filename(new_title)
+        if not old_canon or not new_canon:
             QMessageBox.warning(self, "Переименование", "Некорректное имя.")
             return False
-        if old_stem == new_stem:
-            return False
-
-        old_path = self.vault_dir / f"{old_stem}.md"
-        new_path = self.vault_dir / f"{new_stem}.md"
-
-        if not old_path.exists():
-            QMessageBox.critical(self, "Переименование", f"Файл не найден:\n{old_path}")
-            return False
-        if new_path.exists():
-            QMessageBox.warning(
-                self,
-                "Переименование",
-                f"Заметка с таким именем уже существует:\n{new_path.name}",
-            )
+        if old_canon == new_canon:
             return False
 
         # Make sure current edits are saved (robust)
         self._stop_timers_and_flush(reason="rename_note")
 
-        log.info("Rename note: %s -> %s", old_stem, new_stem)
+        log.info("Rename title: %s -> %s (note_id=%s)", old_title, new_title, self.current_note_id)
 
-        # 1) Rename file on disk
+        # 1) Update title inside the current note file (frontmatter + H1)
         try:
-            old_path.replace(new_path)  # atomic-ish rename on same filesystem
+            from note_io import set_note_title_in_text
+            txt = read_note_text(self.current_path)
+            new_txt, changed = set_note_title_in_text(txt, new_title=new_title)
+            if not changed:
+                return False
+            atomic_write_text(self.current_path, new_txt, encoding="utf-8")
         except Exception as e:
-            log.exception("Rename failed: %s -> %s", old_path, new_path)
-            QMessageBox.critical(self, "Переименование", f"Не удалось переименовать файл:\n{e}")
+            log.exception("Failed to update note title in file: %s", self.current_path)
+            QMessageBox.critical(self, "Переименование", f"Не удалось обновить title в файле:\n{e}")
             return False
 
-        # 2) Update navigation history (back/forward/current) for renamed title
-        self._nav.rename_title(old_stem, new_stem)
+        # 2) Rebuild catalog (title mapping changed)
+        try:
+            self._rebuild_catalog()
+        except Exception:
+            pass
 
-        # 3) Обновление ссылок по vault — ТЯЖЁЛОЕ, уводим в фон + прогресс
-        # (UI обновим в колбэке по завершению)
-        self._rename.start(old_stem=old_stem, new_stem=new_stem, new_path=new_path)
+        # 3) Mass rewrite wikilinks across vault (old title -> new title)
+        # File path is unchanged in note_id model.
+        self._rename.start(old_stem=old_title, new_stem=new_title, new_path=self.current_path)
         return True
 
     def save_now(
