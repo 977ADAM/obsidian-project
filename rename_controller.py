@@ -41,7 +41,7 @@ class RenameRewriteController:
         req_id = self._req_id
 
         self._cancel_event = threading.Event()
-        files = sorted(app.vault_dir.glob("*.md"), key=lambda p: p.name.lower())
+        files = sorted(app.vault_dir.rglob("*.md"), key=lambda p: p.name.lower())
 
         dlg = QProgressDialog("Обновляю ссылки по хранилищу…", "Отмена", 0, max(1, len(files)), app)
         dlg.setWindowTitle("Переименование: обновление ссылок")

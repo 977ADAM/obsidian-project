@@ -32,7 +32,7 @@ class LinkIndex:
         """
         self.clear()
 
-        for path in vault_dir.glob("*.md"):
+        for path in vault_dir.rglob("*.md"):
             try:
                 text = path.read_text(encoding="utf-8")
             except Exception:

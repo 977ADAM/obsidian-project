@@ -461,7 +461,7 @@ class NotesApp(QMainWindow):
 
         def get_titles():
             # заметки на диске (без виртуальных)
-            return [p.stem for p in self.vault_dir.glob("*.md")]
+            return [p.stem for p in self.vault_dir.rglob("*.md")]
 
         dlg = QuickSwitcherDialog(self, get_titles=get_titles, on_open=self.open_or_create_by_title)
         dlg.exec()
@@ -516,7 +516,7 @@ class NotesApp(QMainWindow):
         dt_ms = (time.perf_counter() - t0) * 1000.0
         log.info(
             "Link index rebuilt: notes=%d incoming_keys=%d outgoing_keys=%d time_ms=%.1f",
-            len(list(self.vault_dir.glob("*.md"))),
+            len(list(self.vault_dir.rglob("*.md"))),
             len(self._link_index.incoming),
             len(self._link_index.outgoing),
             dt_ms,
@@ -524,7 +524,7 @@ class NotesApp(QMainWindow):
 
     def list_notes(self) -> list[Path]:
         assert self.vault_dir is not None
-        return sorted(self.vault_dir.glob("*.md"), key=lambda p: p.name.lower())
+        return sorted(self.vault_dir.rglob("*.md"), key=lambda p: p.name.lower())
 
     def refresh_list(self):
         if self.vault_dir is None:
@@ -798,7 +798,7 @@ class NotesApp(QMainWindow):
         outgoing_snapshot: dict[str, list[str]] = {
             src: sorted(dsts) for src, dsts in self._link_index.outgoing.items()
         }
-        existing_titles = {p.stem for p in vault_dir.glob("*.md")}
+        existing_titles = {p.stem for p in vault_dir.rglob("*.md")}
         return {
             "vault_dir": vault_dir,
             "mode": self.graph_mode,
