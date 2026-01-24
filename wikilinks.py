@@ -113,7 +113,7 @@ def wikilinks_to_html(
     def replacer(match: re.Match) -> str:
         inner = (match.group(1) or "").strip()
         if not inner:
-            return ""
+            return match.group(0)
 
         target, alias = _split_alias(inner)
         label = alias if alias is not None else target

@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QTextEdit
 from filesystem import atomic_write_text
 from qt_utils import blocked_signals
 
-_FM_RE = re.compile(r"(?s)\A---\s*\n(.*?)\n---\s*\n")
+_FM_RE = re.compile(r"(?s)\A---\s*\n(.*?)\n---\s*(?:\n|$)")
 _NOTE_ID_RE = re.compile(r"(?m)^\s*note_id\s*:\s*(.+?)\s*$")
 _TITLE_RE = re.compile(r"(?m)^\s*title\s*:\s*(.+?)\s*$")
 _H1_RE = re.compile(r"(?m)^\s*#\s+(.+?)\s*$")
@@ -48,7 +48,7 @@ def set_note_title_in_text(text: str, *, new_title: str) -> tuple[str, bool]:
         else:
             fm2 = fm.rstrip() + f"\ntitle: {new_title}\n"
         if fm2 != fm:
-            out = _FM_RE.sub(lambda _: f"---\n{fm2}\n---\n", out, count=1)
+            out = _FM_RE.sub(lambda _: f"---\n{fm2}\n---\n\n", out, count=1)
             changed = True
     else:
         # no frontmatter:
@@ -135,7 +135,7 @@ def ensure_note_has_id(path: Path) -> str:
         fm = m.group(1) or ""
         if not _NOTE_ID_RE.search(fm):
             fm2 = f"note_id: {new_id}\n" + fm
-            new_text = _FM_RE.sub(lambda _: f"---\n{fm2}\n---\n", text, count=1)
+            new_text = _FM_RE.sub(lambda _: f"---\n{fm2}\n---\n\n", text, count=1)
         else:
             new_text = text
     else:

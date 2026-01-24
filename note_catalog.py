@@ -38,7 +38,8 @@ class NoteCatalog:
         if migrate_to_id_paths:
             notes_dir.mkdir(parents=True, exist_ok=True)
 
-        for path in vault_dir.rglob("*.md"):
+        paths = list(vault_dir.rglob("*.md"))
+        for path in paths:
             try:
                 text = read_note_text(path)
             except Exception:

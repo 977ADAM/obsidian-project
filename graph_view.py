@@ -41,6 +41,9 @@ class GraphNode(QGraphicsEllipseItem):
 
         self.setPen(self.pen_default)
         self.setBrush(self.brush_default)
+        # Forced state is used by GraphView.highlight() so hover doesn't destroy highlight.
+        # Values: "normal" | "neighbor" | "current"
+        self._forced_state = "normal"
 
         # label
         self.label = QGraphicsSimpleTextItem(label, self)
@@ -55,15 +58,27 @@ class GraphNode(QGraphicsEllipseItem):
         self.glow.setVisible(True)
         super().hoverEnterEvent(event)
 
-    def hoverLeaveEvent(self, event):
-        if self.isSelected():
+    def apply_forced_state(self, state: str) -> None:
+        self._forced_state = state or "normal"
+        if self._forced_state == "current":
             self.setPen(self.pen_selected)
             self.setBrush(self.brush_selected)
             self.glow.setVisible(True)
+        elif self._forced_state == "neighbor":
+            self.setPen(self.pen_hover)
+            self.setBrush(self.brush_hover)
+            self.glow.setVisible(False)
         else:
             self.setPen(self.pen_default)
             self.setBrush(self.brush_default)
             self.glow.setVisible(False)
+
+    def hoverLeaveEvent(self, event):
+        # Restore highlight state set by GraphView.highlight()
+        try:
+            self.apply_forced_state(getattr(self, "_forced_state", "normal"))
+        except Exception:
+            pass
         self.setScale(1.0)
         super().hoverLeaveEvent(event)
 
@@ -238,17 +253,11 @@ class GraphView(QGraphicsView):
         for nid, node in self.nodes.items():
             node.setSelected(False)  # чтобы hover/leave корректно возвращал стиль
             if nid == current_id:
-                node.setPen(node.pen_selected)
-                node.setBrush(node.brush_selected)
-                node.glow.setVisible(True)
+                node.apply_forced_state("current")
             elif nid in neighbors:
-                node.setPen(node.pen_hover)
-                node.setBrush(node.brush_hover)
-                node.glow.setVisible(False)
+                node.apply_forced_state("neighbor")
             else:
-                node.setPen(node.pen_default)
-                node.setBrush(node.brush_default)
-                node.glow.setVisible(False)
+                node.apply_forced_state("normal")
 
     def mousePressEvent(self, event):
         item = self.itemAt(event.position().toPoint())
