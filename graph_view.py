@@ -88,8 +88,8 @@ class GraphView(QGraphicsView):
         super().__init__()
         self.on_open_note = on_open_note
         self.setRenderHints(QPainter.Antialiasing)
-        self.scene = QGraphicsScene(self)
-        self.setScene(self.scene)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.edge_items: dict[tuple[str, str], QGraphicsLineItem] = {}
@@ -281,7 +281,7 @@ class GraphView(QGraphicsView):
         # nodes: list[note_id]
         labels = labels or {}
         prev_pos = {nid: node.pos() for nid, node in self.nodes.items()}
-        self.scene.clear()
+        self._scene.clear()
         self.nodes.clear()
         self.edges = edges[:]
         self.edge_items.clear()
@@ -313,7 +313,7 @@ class GraphView(QGraphicsView):
             label = labels.get(nid) or nid
             node = GraphNode(nid, label, sp.x(), sp.y(), degree=deg.get(nid, 0), theme=self._t, r_base=10.0)
             node.setZValue(10)
-            self.scene.addItem(node)
+            self._scene.addItem(node)
             self.nodes[nid] = node
 
         for a, b in edges:
@@ -325,12 +325,12 @@ class GraphView(QGraphicsView):
             line = QGraphicsLineItem(p1.x(), p1.y(), p2.x(), p2.y())
             line.setPen(pen_edge)
             line.setZValue(-10)
-            self.scene.addItem(line)
+            self._scene.addItem(line)
 
             self.edge_items[(a, b)] = line
 
-        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-120, -120, 120, 120))
-        self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        self._scene.setSceneRect(self._scene.itemsBoundingRect().adjusted(-120, -120, 120, 120))
+        self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
         self._set_lod_target()
         self.animate_to(target_pos)
 

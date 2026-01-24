@@ -24,8 +24,19 @@ class NoteCatalog:
 
     def __init__(self) -> None:
         self.by_id: Dict[str, NoteInfo] = {}
-        self.by_title: Dict[str, str] = {}  # canonical title -> note_id
+        # canonical title key (case-insensitive) -> note_id
+        self.by_title: Dict[str, str] = {}
         self.by_path: Dict[Path, str] = {}  # path -> note_id
+
+    @staticmethod
+    def _title_key(title: str) -> str:
+        """
+        Key for resolving titles from UI/wikilinks:
+        - filesystem-safe
+        - case-insensitive (prevents duplicates from different casing)
+        """
+        canon = safe_filename(title)
+        return canon.casefold() if canon else ""
 
     def clear(self) -> None:
         self.by_id.clear()
@@ -87,18 +98,18 @@ class NoteCatalog:
             self.by_id[note_id] = info
             self.by_path[path] = note_id
 
-            canon = safe_filename(effective_title)
-            if canon and canon not in self.by_title:
-                self.by_title[canon] = note_id
+            key = self._title_key(effective_title)
+            if key and key not in self.by_title:
+                self.by_title[key] = note_id
 
     def path_to_id(self, path: Path) -> Optional[str]:
         return self.by_path.get(Path(path))
 
     def resolve_title(self, title: str) -> Optional[str]:
-        canon = safe_filename(title)
-        if not canon:
+        key = self._title_key(title)
+        if not key:
             return None
-        return self.by_title.get(canon)
+        return self.by_title.get(key)
 
     def get(self, note_id: str) -> Optional[NoteInfo]:
         return self.by_id.get(note_id)

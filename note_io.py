@@ -13,13 +13,22 @@ _NOTE_ID_RE = re.compile(r"(?m)^\s*note_id\s*:\s*(.+?)\s*$")
 _TITLE_RE = re.compile(r"(?m)^\s*title\s*:\s*(.+?)\s*$")
 _H1_RE = re.compile(r"(?m)^\s*#\s+(.+?)\s*$")
 
+def _yaml_quote(value: str) -> str:
+    """
+    Minimal YAML-safe quoting for scalar values.
+    Avoids breaking frontmatter on ':', '#', quotes, etc.
+    """
+    v = (value or "").strip().replace("\n", " ")
+    v = v.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{v}"'
+
 def _build_frontmatter(*, title: str, note_id: str) -> str:
     title = (title or "").strip() or "Untitled"
     note_id = (note_id or "").strip() or generate_note_id()
     return (
         "---\n"
         f"note_id: {note_id}\n"
-        f"title: {title}\n"
+        f"title: {_yaml_quote(title)}\n"
         "---\n\n"
     )
 
@@ -43,10 +52,11 @@ def set_note_title_in_text(text: str, *, new_title: str) -> tuple[str, bool]:
     m = _FM_RE.match(out)
     if m:
         fm = m.group(1) or ""
+        qt = _yaml_quote(new_title)
         if _TITLE_RE.search(fm):
-            fm2 = _TITLE_RE.sub(f"title: {new_title}", fm, count=1)
+            fm2 = _TITLE_RE.sub(lambda _: f"title: {qt}", fm, count=1)
         else:
-            fm2 = fm.rstrip() + f"\ntitle: {new_title}\n"
+            fm2 = fm.rstrip() + f"\ntitle: {qt}\n"
         if fm2 != fm:
             out = _FM_RE.sub(lambda _: f"---\n{fm2}\n---\n\n", out, count=1)
             changed = True
