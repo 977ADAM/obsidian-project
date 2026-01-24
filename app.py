@@ -167,7 +167,7 @@ class NotesApp(QMainWindow):
         self.search.textChanged.connect(self.refresh_list)
         self.listw.itemSelectionChanged.connect(self._on_select_note)
         self.editor.textChanged.connect(self._on_text_changed)
-        self.preview.linkClicked.connect(self.open_or_create_by_title)
+        self.preview.linkClicked.connect(self.open_note_ref)
 
         # Menu
         self._build_menu()
@@ -584,6 +584,26 @@ class NotesApp(QMainWindow):
         if nid:
             return self.open_by_id(nid)
         return self.create_and_open(title)
+    
+    def open_note_ref(self, ref: str):
+        """
+        Open reference from preview/navigation.
+        `ref` can be:
+          - note_id (preferred)
+          - title (legacy)
+        """
+        if self.vault_dir is None:
+            return
+        ref = (ref or "").strip()
+        if not ref:
+            return
+
+        # 1) Try as note_id
+        if self._catalog.get(ref):
+            return self.open_by_id(ref)
+
+        # 2) Fallback: treat as title
+        return self.open_or_create_by_title(ref)
 
     def open_by_id(self, note_id: str) -> None:
         info = self._catalog.get(note_id)
@@ -653,7 +673,7 @@ class NotesApp(QMainWindow):
         if getattr(self, "_last_preview_source_text", None) == text:
             return
         self._last_preview_source_text = text
-        self.preview.setHtml(render_preview_page(text))
+        self.preview.setHtml(render_preview_page(text, resolve_title_to_id=self._catalog.resolve_title))
 
     def rename_current_note_dialog(self):
         """
@@ -725,7 +745,7 @@ class NotesApp(QMainWindow):
 
         # 3) Mass rewrite wikilinks across vault (old title -> new title)
         # File path is unchanged in note_id model.
-        self._rename.start(old_stem=old_title, new_stem=new_title, new_path=self.current_path)
+        self._rename.start(old_title=old_title, new_title=new_title)
         return True
 
     def save_now(
@@ -892,7 +912,16 @@ class NotesApp(QMainWindow):
         except Exception:
             self.graph._layout_steps = 250
 
-        self.graph.build(nodes, edges)
+        labels: dict[str, str] = {}
+        try:
+            for nid in nodes:
+                info = self._catalog.get(nid)
+                if info:
+                    labels[nid] = info.title
+        except Exception:
+            pass
+
+        self.graph.build(nodes, edges, labels=labels)
         if self.current_note_id:
             self.graph.highlight(self.current_note_id)
             self.graph.center_on(self.current_note_id)

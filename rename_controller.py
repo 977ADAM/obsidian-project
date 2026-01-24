@@ -1,13 +1,10 @@
 import logging
 import threading
-from pathlib import Path
 
 from PySide6.QtCore import Qt, QThreadPool, Slot
 from PySide6.QtWidgets import QProgressDialog, QMessageBox
 
-from filenames import safe_filename
 from logging_setup import APP_NAME, LOG_PATH
-from qt_utils import blocked_signals
 from rename_worker import _RenameRewriteWorker
 
 
@@ -26,7 +23,7 @@ class RenameRewriteController:
         self._cancel_event: threading.Event | None = None
         self._progress: QProgressDialog | None = None
 
-    def start(self, *, old_stem: str, new_stem: str, new_path: Path) -> None:
+    def start(self, *, old_title: str, new_title: str) -> None:
         app = self._app
         if app.vault_dir is None:
             return
@@ -63,12 +60,12 @@ class RenameRewriteController:
             req_id=req_id,
             vault_dir=app.vault_dir,
             files=files,
-            old_stem=old_stem,
-            new_stem=new_stem,
+            old_title=old_title,
+            new_title=new_title,
             cancel_event=self._cancel_event,
         )
         worker.signals.progress.connect(self._on_progress)
-        worker.signals.finished.connect(lambda rid, res: self._on_finished(rid, res, new_path=new_path))
+        worker.signals.finished.connect(lambda rid, res: self._on_finished(rid, res))
         worker.signals.failed.connect(self._on_failed)
         self._pool.start(worker)
 
@@ -99,7 +96,7 @@ class RenameRewriteController:
         self._cancel_event = None
         app._set_ui_busy(False)
 
-    def _on_finished(self, req_id: int, result: dict, *, new_path: Path) -> None:
+    def _on_finished(self, req_id: int, result: dict) -> None:
         if req_id != self._req_id:
             return
         app = self._app
@@ -113,25 +110,8 @@ class RenameRewriteController:
             result.get("total_files"), result.get("changed_files"), canceled, len(error_files),
         )
 
-        try:
-            if app.current_path and app.current_path.stem == safe_filename(new_path.stem):
-                app.current_path = new_path
-            elif app.current_path and app.current_path.stem == safe_filename(result.get("old_stem") or ""):
-                app.current_path = new_path
-        except Exception:
-            pass
-
-        if app.current_path and app.current_path == new_path:
-            try:
-                text = new_path.read_text(encoding="utf-8")
-            except Exception:
-                text = app.editor.toPlainText()
-
-            with blocked_signals(app.editor):
-                app.editor.setPlainText(text)
-            app._dirty = False
-            app._last_saved_text = text
-            app._render_preview(text)
+        # In note_id model file path doesn't change on rename (title change only).
+        # Keep editor state as-is; vault rewrite only touched other files.
 
         try:
             app._rebuild_link_index()
@@ -139,10 +119,18 @@ class RenameRewriteController:
             log.exception("Failed to rebuild link index after rename rewrite")
 
         app.refresh_list()
-        app._select_in_list(new_path.stem)
+        # Re-select current note by title
+        try:
+            if app.current_note_id:
+                info = app._catalog.get(app.current_note_id)
+                if info:
+                    app._select_in_list(info.title)
+        except Exception:
+            pass
         app.request_build_link_graph(immediate=True)
-        app.graph.highlight(new_path.stem)
-        app.graph.center_on(new_path.stem)
+        if app.current_note_id:
+            app.graph.highlight(app.current_note_id)
+            app.graph.center_on(app.current_note_id)
         app.refresh_backlinks()
 
         if canceled:

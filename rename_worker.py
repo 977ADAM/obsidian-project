@@ -20,16 +20,16 @@ class _RenameRewriteWorker(QRunnable):
         req_id: int,
         vault_dir: Path,
         files: list[Path],
-        old_stem: str,
-        new_stem: str,
+        old_title: str,
+        new_title: str,
         cancel_event: threading.Event,
     ):
         super().__init__()
         self.req_id = req_id
         self.vault_dir = vault_dir
         self.files = files
-        self.old_stem = safe_filename(old_stem)
-        self.new_stem = safe_filename(new_stem)
+        self.old_title = safe_filename(old_title)
+        self.new_title = safe_filename(new_title)
         self.cancel_event = cancel_event
         self.signals = _RenameRewriteSignals()
 
@@ -61,8 +61,8 @@ class _RenameRewriteWorker(QRunnable):
 
                     new_txt, changed = rewrite_wikilinks_targets(
                         txt,
-                        old_stem=self.old_stem,
-                        new_stem=self.new_stem,
+                        old_stem=self.old_title,
+                        new_stem=self.new_title,
                     )
                     if changed:
                         atomic_write_text(p, new_txt, encoding="utf-8")
@@ -73,8 +73,8 @@ class _RenameRewriteWorker(QRunnable):
                     continue
 
             result = {
-                "old_stem": self.old_stem,
-                "new_stem": self.new_stem,
+                "old_title": self.old_title,
+                "new_title": self.new_title,
                 "total_files": total_files,
                 "changed_files": changed_files,
                 "error_files": error_files,

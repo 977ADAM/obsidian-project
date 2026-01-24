@@ -26,8 +26,8 @@ class _NoteInterceptPage(QWebEnginePage):
             raw = (url.path() or "").lstrip("/")
             if not raw:
                 raw = url.host() or ""
-            title = unquote(raw).strip()
-            self._view.linkClicked.emit(title)
+            note_ref = unquote(raw).strip()
+            self._view.linkClicked.emit(note_ref)
             return False  # блокируем реальную навигацию
         return super().acceptNavigationRequest(url, nav_type, isMainFrame)
 

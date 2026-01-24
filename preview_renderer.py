@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import markdown as md
 
+from typing import Callable, Optional
 from wikilinks import wikilinks_to_html
 from html_sanitizer import sanitize_rendered_html
 
@@ -17,14 +18,18 @@ BASE_CSS = """
 """
 
 
-def render_markdown_to_safe_html(note_text: str) -> str:
+def render_markdown_to_safe_html(
+    note_text: str,
+    *,
+    resolve_title_to_id: Callable[[str], Optional[str]] | None = None,
+) -> str:
     """
     note text -> HTML:
       1) convert [[wikilinks]] to <a>
       2) markdown -> HTML
       3) sanitize HTML
     """
-    text2 = wikilinks_to_html(note_text)
+    text2 = wikilinks_to_html(note_text, resolve_title_to_id=resolve_title_to_id)
     rendered = md.markdown(text2, extensions=MD_EXTENSIONS)
     return sanitize_rendered_html(rendered)
 
@@ -42,6 +47,10 @@ def wrap_html_page(rendered_html: str, *, css: str = BASE_CSS) -> str:
     """
 
 
-def render_preview_page(note_text: str) -> str:
+def render_preview_page(
+    note_text: str,
+    *,
+    resolve_title_to_id: Callable[[str], Optional[str]] | None = None,
+) -> str:
     """Convenience: note text -> full HTML page."""
-    return wrap_html_page(render_markdown_to_safe_html(note_text))
+    return wrap_html_page(render_markdown_to_safe_html(note_text, resolve_title_to_id=resolve_title_to_id))

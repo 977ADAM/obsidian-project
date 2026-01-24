@@ -3,6 +3,7 @@ import re
 from urllib.parse import quote
 
 from filenames import safe_filename
+from typing import Callable, Optional
 
 
 # [[target]]
@@ -20,9 +21,10 @@ def extract_wikilink_targets(markdown_text: str) -> set[str]:
       [[Note#Heading]]
       [[Note^block]]
 
-    Returned targets are normalized via safe_filename().
+    Returned targets are canonicalized via safe_filename() (i.e. "title_key"),
+    not the original display title.
     """
-    targets: set[str] = set()
+    targets: set[str] = set() # canonical title_key
 
     if not markdown_text:
         return targets
@@ -91,15 +93,19 @@ def rewrite_wikilinks_targets(
     return rewritten, changed
 
 
-def wikilinks_to_html(markdown_text: str) -> str:
+def wikilinks_to_html(
+    markdown_text: str,
+    *,
+    resolve_title_to_id: Callable[[str], Optional[str]] | None = None,
+) -> str:
     """
     Convert wikilinks into HTML <a> tags.
 
-    [[Note]]        → <a href="note://Note">Note</a>
-    [[Note|Alias]]  → <a href="note://Note">Alias</a>
+    [[Note]]        → <a href="note://<note_id or canonical title>">Note</a>
+    [[Note|Alias]]  → <a href="note://<note_id or canonical title>">Alias</a>
 
     - label is HTML-escaped
-    - href uses canonical safe_filename + URL encoding
+    - href prefers note_id (if resolver provided & note exists), else canonical safe_filename
     """
     if not markdown_text:
         return markdown_text
@@ -117,8 +123,18 @@ def wikilinks_to_html(markdown_text: str) -> str:
         #   [[Note^block]]    -> note://Note#^block   (fragment)
         base, suffix = _split_suffix(target)
 
-        canonical_base = safe_filename(base)
-        href = "note://" + quote(canonical_base, safe="")
+        # Prefer stable note_id for navigation, fallback to canonical title.
+        href_target = None
+        if resolve_title_to_id is not None:
+            try:
+                href_target = resolve_title_to_id(base)
+            except Exception:
+                href_target = None
+
+        if not href_target:
+            href_target = safe_filename(base)
+
+        href = "note://" + quote(href_target, safe="")
 
         # Preserve heading/block as URL fragment so the interceptor does NOT treat it
         # as part of the note title (prevents creating "Note#Heading" / "Note^block" notes).

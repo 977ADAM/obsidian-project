@@ -268,8 +268,9 @@ class GraphView(QGraphicsView):
                 return
         super().mousePressEvent(event)
 
-    def build(self, nodes: list[str], edges: list[tuple[str, str]]):
+    def build(self, nodes: list[str], edges: list[tuple[str, str]], labels: dict[str, str] | None = None):
         # nodes: list[note_id]
+        labels = labels or {}
         prev_pos = {nid: node.pos() for nid, node in self.nodes.items()}
         self.scene.clear()
         self.nodes.clear()
@@ -300,8 +301,8 @@ class GraphView(QGraphicsView):
         for nid in nodes:
             tp = target_pos[nid]
             sp = prev_pos.get(nid, tp)  # старт = старая позиция, если есть
-            # label пока = note_id (UI-слой может позже заменить на title)
-            node = GraphNode(nid, nid, sp.x(), sp.y(), degree=deg.get(nid, 0), theme=self._t, r_base=10.0)
+            label = labels.get(nid) or nid
+            node = GraphNode(nid, label, sp.x(), sp.y(), degree=deg.get(nid, 0), theme=self._t, r_base=10.0)
             node.setZValue(10)
             self.scene.addItem(node)
             self.nodes[nid] = node
