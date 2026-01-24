@@ -1,11 +1,96 @@
 from __future__ import annotations
-
+import re
+import uuid
 from pathlib import Path
 
 from PySide6.QtWidgets import QTextEdit
 
 from filesystem import atomic_write_text
 from qt_utils import blocked_signals
+
+_FM_RE = re.compile(r"(?s)\A---\s*\n(.*?)\n---\s*\n")
+_NOTE_ID_RE = re.compile(r"(?m)^\s*note_id\s*:\s*(.+?)\s*$")
+_TITLE_RE = re.compile(r"(?m)^\s*title\s*:\s*(.+?)\s*$")
+_H1_RE = re.compile(r"(?m)^\s*#\s+(.+?)\s*$")
+
+
+def generate_note_id() -> str:
+    # короткий, но достаточно уникальный для vault; при желании можно UUID целиком
+    return uuid.uuid4().hex
+
+
+def parse_note_meta(text: str) -> tuple[str | None, str | None]:
+    """
+    Best-effort парсинг метаданных заметки:
+      - YAML frontmatter: note_id/title
+      - fallback title: первая H1 строка "# ..."
+    """
+    if not text:
+        return None, None
+
+    m = _FM_RE.match(text)
+    if m:
+        fm = m.group(1) or ""
+        note_id = None
+        title = None
+        mid = _NOTE_ID_RE.search(fm)
+        if mid:
+            note_id = (mid.group(1) or "").strip().strip('"').strip("'")
+        mt = _TITLE_RE.search(fm)
+        if mt:
+            title = (mt.group(1) or "").strip().strip('"').strip("'")
+        return note_id or None, title or None
+
+    # no frontmatter → fallback title from first H1
+    mh1 = _H1_RE.search(text)
+    if mh1:
+        return None, (mh1.group(1) or "").strip() or None
+    return None, None
+
+
+def build_new_note_text(*, title: str, note_id: str) -> str:
+    title = (title or "").strip() or "Untitled"
+    note_id = (note_id or "").strip() or generate_note_id()
+    return (
+        "---\n"
+        f"note_id: {note_id}\n"
+        f"title: {title}\n"
+        "---\n\n"
+        f"# {title}\n\n"
+    )
+
+
+def ensure_note_has_id(path: Path) -> str:
+    """
+    Миграция 'на лету':
+    - если note_id уже есть → вернуть
+    - если нет → сгенерить, дописать frontmatter (atomic), вернуть
+    """
+    text = read_note_text(path)
+    note_id, title = parse_note_meta(text)
+    if note_id:
+        return note_id
+
+    new_id = generate_note_id()
+    # если уже есть H1 — используем её как title, иначе берём stem
+    effective_title = title or path.stem
+
+    # если есть frontmatter, но без note_id — аккуратно добавим (упрощённо: пересоберём)
+    m = _FM_RE.match(text or "")
+    if m:
+        # prepend note_id line внутрь frontmatter
+        fm = m.group(1) or ""
+        if not _NOTE_ID_RE.search(fm):
+            fm2 = f"note_id: {new_id}\n" + fm
+            new_text = _FM_RE.sub(lambda _: f"---\n{fm2}\n---\n", text, count=1)
+        else:
+            new_text = text
+    else:
+        # нет frontmatter → добавляем новый
+        new_text = build_new_note_text(title=effective_title, note_id=new_id) + (text or "")
+
+    atomic_write_text(path, new_text, encoding="utf-8")
+    return new_id
 
 
 def note_path(vault_dir: Path, stem: str) -> Path:
@@ -20,7 +105,12 @@ def ensure_note_exists(path: Path, title: str) -> None:
     """Создаёт заметку на диске, если её нет."""
     if path.exists():
         return
-    atomic_write_text(path, f"# {title}\n\n", encoding="utf-8")
+    # старый API оставляем, но пишем уже "правильный" шаблон с note_id/title
+    atomic_write_text(
+        path,
+        build_new_note_text(title=title, note_id=generate_note_id()),
+        encoding="utf-8",
+    )
 
 
 def read_note_text(path: Path) -> str:

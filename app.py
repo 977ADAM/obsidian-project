@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, QTimer, QThreadPool, QSettings
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QListWidget, QTextEdit, QLineEdit, QFileDialog, QMessageBox, QSplitter
+    QListWidget, QListWidgetItem, QTextEdit, QLineEdit, QFileDialog, QMessageBox, QSplitter
 )
 
 from filenames import safe_filename
@@ -24,7 +24,8 @@ from webview import LinkableWebView
 from ui_state import UiStateStore
 from ui_dialogs import ask_vault_cancel_action, build_rename_dialog
 from qt_utils import blocked_signals, safe_set_setting
-from note_io import note_path, ensure_note_exists, read_note_text, set_editor_text
+from note_io import ensure_note_exists, read_note_text, set_editor_text, generate_note_id, build_new_note_text
+from note_catalog import NoteCatalog
 from rename_controller import RenameRewriteController
 from app_helpers import (
     AUTOSAVE_DEBOUNCE_MS,
@@ -64,10 +65,12 @@ class NotesApp(QMainWindow):
 
         # startup restore targets (vault + last note)
         self._startup_vault_dir = get_str(self._settings, SettingsKeys.VAULT_DIR, "") or ""
-        self._startup_last_note = get_str(self._settings, SettingsKeys.LAST_NOTE, "") or ""
+        self._startup_last_note_id = get_str(self._settings, SettingsKeys.LAST_NOTE_ID, "") or ""
+        self._startup_last_note_title = get_str(self._settings, SettingsKeys.LAST_NOTE, "") or ""
 
         self.vault_dir: Path | None = None
         self.current_path: Path | None = None
+        self.current_note_id: str | None = None
 
         # Token that changes every time we open/switch note.
         # Used to avoid autosave race writing to the wrong file.
@@ -75,9 +78,10 @@ class NotesApp(QMainWindow):
 
         # --- LINK INDEX ---
         self._link_index = LinkIndex()
+        self._catalog = NoteCatalog()
 
         # ---- NAVIGATION ----
-        self._nav = NavigationController(self._open_note_no_history)
+        self._nav = NavigationController(lambda nid: (self.open_by_id(nid) or True))
 
         self._dirty = False
         self._pending_save_token: str = self._note_token
@@ -195,7 +199,7 @@ class NotesApp(QMainWindow):
             default_ms=PREVIEW_DEBOUNCE_MS_DEFAULT,
         )
 
-    def _switch_to_note(self, *, path: Path, title: str) -> None:
+    def _switch_to_note(self, *, note_id: str, path: Path, title: str) -> None:
         """
         Единый сценарий переключения заметки (без истории):
           - стоп таймеров предыдущей заметки
@@ -208,9 +212,14 @@ class NotesApp(QMainWindow):
         ensure_note_exists(path, title)
 
         self.current_path = path
+        self.current_note_id = note_id
         self._note_token = uuid.uuid4().hex
 
         # persist last opened note
+        # Persist last opened note as note_id (preferred).
+        if note_id:
+            safe_set_setting(self._settings, SettingsKeys.LAST_NOTE_ID, note_id)
+        # Legacy (optional): keep writing title for a couple of versions, then delete.
         safe_set_setting(self._settings, SettingsKeys.LAST_NOTE, title)
 
         text = read_note_text(path)
@@ -223,8 +232,8 @@ class NotesApp(QMainWindow):
         self._select_in_list(title)
 
         self.request_build_link_graph(immediate=True)
-        self.graph.highlight(title)
-        self.graph.center_on(title)
+        self.graph.highlight(note_id)
+        self.graph.center_on(note_id)
         self.refresh_backlinks()
 
     def _set_ui_busy(self, busy: bool) -> None:
@@ -323,13 +332,18 @@ class NotesApp(QMainWindow):
         else:
             self.choose_vault()
 
-        # open last note (if exists)
+        # open last note (if exists) — prefer note_id
         try:
-            if self.vault_dir and self._startup_last_note:
-                stem = safe_filename(self._startup_last_note)
-                p = note_path(self.vault_dir, stem)
-                if p.exists():
-                    self._open_note_no_history(p.stem)
+            if self.vault_dir and self._startup_last_note_id:
+                if self._catalog.get(self._startup_last_note_id):
+                    self.open_by_id(self._startup_last_note_id)
+                    return
+
+            # fallback: legacy title (best-effort)
+            if self.vault_dir and self._startup_last_note_title:
+                nid = self._catalog.resolve_title(self._startup_last_note_title)
+                if nid:
+                    self.open_by_id(nid)
         except Exception:
             log.exception("Failed to open last note on startup")
 
@@ -348,9 +362,16 @@ class NotesApp(QMainWindow):
         self._last_saved_text = ""
         self._nav.clear()
 
+        self._rebuild_catalog()
         self._rebuild_link_index()
         self.refresh_list()
         self.request_build_link_graph(immediate=True)
+
+    def _rebuild_catalog(self) -> None:
+        if self.vault_dir is None:
+            self._catalog.clear()
+            return
+        self._catalog.rebuild(self.vault_dir)
 
     def closeEvent(self, event):  # type: ignore[override]
         """
@@ -460,8 +481,7 @@ class NotesApp(QMainWindow):
             return
 
         def get_titles():
-            # заметки на диске (без виртуальных)
-            return [p.stem for p in self.vault_dir.rglob("*.md")]
+            return [i.title for i in sorted(self._catalog.by_id.values(), key=lambda x: x.title.lower())]
 
         dlg = QuickSwitcherDialog(self, get_titles=get_titles, on_open=self.open_or_create_by_title)
         dlg.exec()
@@ -470,12 +490,11 @@ class NotesApp(QMainWindow):
         """Открывает/создаёт заметку и обновляет UI, но НЕ трогает историю."""
         if self.vault_dir is None:
             return
-
-        stem = safe_filename(title)
-        path = note_path(self.vault_dir, stem)
-        log.info("Открытая заметка (без истории): stem=%s путь=%s", stem, path)
-
-        self._switch_to_note(path=path, title=stem)
+        nid = self._catalog.resolve_title(title)
+        if nid:
+            self.open_by_id(nid)
+            return
+        self.create_and_open(title)
 
     def choose_vault(self):
         log.info("Открылось диалоговое окно «Выбрать хранилище».")
@@ -512,7 +531,11 @@ class NotesApp(QMainWindow):
             self._link_index.clear()
             return
         t0 = time.perf_counter()
-        self._link_index.rebuild_from_vault(self.vault_dir)
+        self._link_index.rebuild_from_vault(
+            self.vault_dir,
+            resolve_title_to_id=self._catalog.resolve_title,
+            path_to_id=lambda p: self._path_to_id(p),
+        )
         dt_ms = (time.perf_counter() - t0) * 1000.0
         log.info(
             "Link index rebuilt: notes=%d incoming_keys=%d outgoing_keys=%d time_ms=%.1f",
@@ -522,39 +545,72 @@ class NotesApp(QMainWindow):
             dt_ms,
         )
 
-    def list_notes(self) -> list[Path]:
-        assert self.vault_dir is not None
-        return sorted(self.vault_dir.rglob("*.md"), key=lambda p: p.name.lower())
+    def _path_to_id(self, path: Path) -> str | None:
+        # best-effort: catalog already built, but keep it safe
+        for nid, info in self._catalog.by_id.items():
+            if info.path == path:
+                return nid
+        return None
+
+    def list_notes(self) -> list[str]:
+        # return note_ids sorted by title
+        return [i.note_id for i in sorted(self._catalog.by_id.values(), key=lambda x: x.title.lower())]
 
     def refresh_list(self):
         if self.vault_dir is None:
             return
         q = self.search.text().strip().lower()
-        notes = self.list_notes()
+        note_ids = self.list_notes()
 
         with blocked_signals(self.listw):
             self.listw.clear()
-            for p in notes:
-                if not q or q in p.stem.lower():
-                    self.listw.addItem(p.stem)
+            for nid in note_ids:
+                info = self._catalog.get(nid)
+                if not info:
+                    continue
+                if not q or q in info.title.lower():
+                    it = QListWidgetItem(info.title)
+                    it.setData(Qt.UserRole, nid)
+                    self.listw.addItem(it)
 
     def _on_select_note(self):
         items = self.listw.selectedItems()
         if not items:
             return
-        title = items[0].text()
-        self.open_or_create_by_title(title)
+        nid = items[0].data(Qt.UserRole)
+        if nid:
+            self.open_by_id(str(nid))
 
     def open_or_create_by_title(self, title: str):
         if self.vault_dir is None:
             return
+        nid = self._catalog.resolve_title(title)
+        if nid:
+            return self.open_by_id(nid)
+        return self.create_and_open(title)
 
-        title = safe_filename(title)
-
-        current = self.current_path.stem if self.current_path else None
-        if current == title:
+    def open_by_id(self, note_id: str) -> None:
+        info = self._catalog.get(note_id)
+        if not info:
             return
-        self._nav.open(title, reopen_current=False)
+        # navigation теперь должна хранить note_id (отдельный шаг, но можно начать тут)
+        self._switch_to_note(note_id=note_id, path=info.path, title=info.title)
+        try:
+            self._nav.open(note_id, reopen_current=False)
+        except Exception:
+            pass
+
+    def create_and_open(self, title: str) -> None:
+        assert self.vault_dir is not None
+        nid = generate_note_id()
+        notes_dir = self.vault_dir / "_notes"
+        notes_dir.mkdir(parents=True, exist_ok=True)
+        path = notes_dir / f"{nid}.md"
+        if not path.exists():
+            atomic_write_text(path, build_new_note_text(title=title, note_id=nid), encoding="utf-8")
+        # обновим каталог (точечно)
+        self._catalog.rebuild(self.vault_dir)
+        self.open_by_id(nid)
 
     def nav_back(self):
         self._nav.back()
@@ -712,7 +768,20 @@ class NotesApp(QMainWindow):
             atomic_write_text(self.current_path, text, encoding="utf-8")
 
             # --- update link index incrementally (fast) ---
-            links_changed = self._link_index.update_note(self.current_path.stem, text)
+            # re-catalog in case user edited title in frontmatter
+            try:
+                self._catalog.rebuild(self.vault_dir)  # можно оптимизировать потом на инкремент
+            except Exception:
+                pass
+
+            src_id = self.current_note_id or self._path_to_id(self.current_path)
+            links_changed = False
+            if src_id:
+                links_changed = self._link_index.update_note(
+                    src_id,
+                    text,
+                    resolve_title_to_id=self._catalog.resolve_title,
+                )
 
             self._dirty = False
             self._last_saved_text = text
@@ -768,12 +837,15 @@ class NotesApp(QMainWindow):
         self.backlinks.clear()
         if self.vault_dir is None or self.current_path is None:
             return
-
-        target = self.current_path.stem
-        refs = self._link_index.backlinks_for(target)
-        log.debug("Обратные ссылки обновлены: цель=%s считать=%d", target, len(refs))
-        for r in refs:
-            self.backlinks.addItem(r)
+        target_id = self.current_note_id or self._path_to_id(self.current_path)
+        if not target_id:
+            return
+        refs = self._link_index.backlinks_for(target_id)
+        log.debug("Обратные ссылки обновлены: цель=%s count=%d", target_id, len(refs))
+        for src_id in refs:
+            info = self._catalog.get(src_id)
+            if info:
+                self.backlinks.addItem(info.title)
 
     def create_note_dialog(self):
         # простой способ: используем строку поиска как ввод имени
@@ -794,11 +866,11 @@ class NotesApp(QMainWindow):
         if self.vault_dir is None:
             return None
         vault_dir = self.vault_dir
-        center = self.current_path.stem if self.current_path else None
+        center = self.current_note_id
         outgoing_snapshot: dict[str, list[str]] = {
             src: sorted(dsts) for src, dsts in self._link_index.outgoing.items()
         }
-        existing_titles = {p.stem for p in vault_dir.rglob("*.md")}
+        existing_titles = set(self._catalog.by_id.keys())
         return {
             "vault_dir": vault_dir,
             "mode": self.graph_mode,
@@ -821,10 +893,9 @@ class NotesApp(QMainWindow):
             self.graph._layout_steps = 250
 
         self.graph.build(nodes, edges)
-        if self.current_path:
-            cur = self.current_path.stem
-            self.graph.highlight(cur)
-            self.graph.center_on(cur)
+        if self.current_note_id:
+            self.graph.highlight(self.current_note_id)
+            self.graph.center_on(self.current_note_id)
 
         log.debug(
             "Граф построен (bg): режим=%s глубина=%s узлы=%d края=%d time_ms=%.1f",

@@ -3,13 +3,13 @@ from collections.abc import Callable
 from typing import TypeAlias
 
 OpenCallbackResult: TypeAlias = bool | None
-OpenCallback: TypeAlias = Callable[[str], OpenCallbackResult]
+OpenCallback: TypeAlias = Callable[[str], OpenCallbackResult]  # note_id
 
 
 class NavigationController:
     """
     Управляет историей навигации заметок (back / forward).
-    Не знает ничего про UI или файлы — только заголовки.
+    Не знает ничего про UI или файлы — только note_id.
     """
 
     def __init__(self, open_callback: OpenCallback, *, history_limit: int | None = None) -> None:
@@ -23,13 +23,13 @@ class NavigationController:
         self._current: str | None = None
 
     @staticmethod
-    def _normalize_title(title: str) -> str:
-        """Привести заголовок к каноническому виду (обрезать пробелы)."""
-        return title.strip()
+    def _normalize_note_id(note_id: str) -> str:
+        """Канонизация note_id (на сегодня: trim)."""
+        return note_id.strip()
 
     @property
     def current(self) -> str | None:
-        """Текущий открытый заголовок (или None, если ничего не открыто)."""
+        """Текущий note_id (или None, если ничего не открыто)."""
         return self._current
 
     @property
@@ -42,7 +42,7 @@ class NavigationController:
         """Есть ли куда перейти вперёд."""
         return self._current is not None and bool(self._forward)
 
-    def _try_open(self, title: str) -> bool:
+    def _try_open(self, note_id: str) -> bool:
         """
         Вызывает callback открытия и интерпретирует результат.
 
@@ -53,7 +53,7 @@ class NavigationController:
           - False (состояние/история не меняются)
         Исключения пробрасываются наружу.
         """
-        result = self._open_callback(title)
+        result = self._open_callback(note_id)
         # Успех: callback вернул None или True.
         # Неуспех: callback вернул False.
         if result is None or result is True:
@@ -65,7 +65,7 @@ class NavigationController:
             f"{type(result).__name__}: {result!r})"
         )
 
-    def open(self, title: str, *, reopen_current: bool = True) -> bool:
+    def open(self, note_id: str, *, reopen_current: bool = True) -> bool:
         """
         Открыть заметку по заголовку.
 
@@ -76,27 +76,27 @@ class NavigationController:
 
         Возвращает True, если открытие было закоммичено (callback успешен).
         """
-        normalized_title = self._normalize_title(title)
-        if not normalized_title:
+        normalized_id = self._normalize_note_id(note_id)
+        if not normalized_id:
             return False
 
         current = self._current
-        if current == normalized_title:
+        if current == normalized_id:
             if not reopen_current:
                 return False
             # Повторное открытие текущей заметки (refresh) — историю не трогаем.
-            return self._try_open(normalized_title)
+            return self._try_open(normalized_id)
 
         # Важно: сначала пробуем открыть в "мире" (UI/файлы),
         # и только после успешного callback коммитим состояние.
-        if not self._try_open(normalized_title):
+        if not self._try_open(normalized_id):
             return False
 
         if current is not None:
             self._back.append(current)
             self._forward.clear()
 
-        self._current = normalized_title
+        self._current = normalized_id
         return True
 
     def back(self) -> bool:
@@ -112,7 +112,7 @@ class NavigationController:
         if not source or current is None:
             return False
 
-        new_current = source[-1]
+        new_current = source[-1] # note_id
 
         # Транзакционность: сначала callback, потом мутация истории.
         if not self._try_open(new_current):
@@ -124,34 +124,8 @@ class NavigationController:
         return True
 
     def rename_title(self, old_title: str, new_title: str) -> None:
-        """
-        Обновить историю (back/forward/current) при переименовании заметки.
-        Ничего не открывает, только меняет сохранённые заголовки.
-        """
-        old_n = self._normalize_title(old_title)
-        new_n = self._normalize_title(new_title)
-        if not old_n or not new_n or old_n == new_n:
-            return
-
-        def _replace_in_deque(d: deque[str]) -> None:
-            if not d:
-                return
-            items = list(d)
-            changed = False
-            for i, t in enumerate(items):
-                if t == old_n:
-                    items[i] = new_n
-                    changed = True
-            if changed:
-                # сохраняем maxlen (read-only) через создание нового deque
-                new_d = deque(items, maxlen=d.maxlen)
-                d.clear()
-                d.extend(new_d)
-
-        if self._current == old_n:
-            self._current = new_n
-        _replace_in_deque(self._back)
-        _replace_in_deque(self._forward)
+        """DEPRECATED: навигация теперь по note_id, переименование заголовка не трогает историю."""
+        return
 
     def clear(self) -> None:
         self._back.clear()

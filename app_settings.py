@@ -13,7 +13,8 @@ class SettingsKeys:
     UI_SPLITTER: str = "ui/splitter_sizes"
     UI_RIGHT_SPLITTER: str = "ui/right_splitter_sizes"
     VAULT_DIR: str = "vault/dir"
-    LAST_NOTE: str = "nav/last_note"
+    LAST_NOTE: str = "nav/last_note"          # legacy: title
+    LAST_NOTE_ID: str = "nav/last_note_id"    # new: note_id
     GRAPH_MODE: str = "graph/mode"
     GRAPH_DEPTH: str = "graph/depth"
     GRAPH_MAX_NODES: str = "graph/max_nodes"

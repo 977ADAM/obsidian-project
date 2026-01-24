@@ -9,11 +9,11 @@ import math
 
 
 class GraphNode(QGraphicsEllipseItem):
-    def __init__(self, title: str, x: float, y: float, degree: int, theme: dict, r_base: float = 10.0):
+    def __init__(self, note_id: str, label: str, x: float, y: float, degree: int, theme: dict, r_base: float = 10.0):
         r = r_base + min(10.0, degree * 1.6)
 
         super().__init__(-r, -r, 2*r, 2*r)
-        self.title = title
+        self.note_id = note_id
         self.r = r
         self.degree = degree
         self._theme = theme
@@ -43,7 +43,7 @@ class GraphNode(QGraphicsEllipseItem):
         self.setBrush(self.brush_default)
 
         # label
-        self.label = QGraphicsSimpleTextItem(title, self)
+        self.label = QGraphicsSimpleTextItem(label, self)
         self.label.setBrush(QBrush(theme["label"]))
         self.label.setPos(r + 6, -8)
         self.label.setOpacity(1.0)
@@ -79,7 +79,7 @@ class GraphView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.edge_items: dict[tuple[str, str], QGraphicsLineItem] = {}
 
-        self.nodes: dict[str, GraphNode] = {}
+        self.nodes: dict[str, GraphNode] = {} # note_id -> node
         self.edges: list[tuple[str, str]] = []
 
         # ---- THEMES ----
@@ -132,7 +132,6 @@ class GraphView(QGraphicsView):
 
         self._lod_current = 1.0
         self._lod_target = 1.0
-
 
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else (1 / 1.15)
@@ -205,21 +204,20 @@ class GraphView(QGraphicsView):
         # во время анимации тоже поддерживаем LOD (если пользователь зумит)
         self._set_lod_target()
 
-
-    def center_on(self, title: str):
-        node = self.nodes.get(title)
+    def center_on(self, note_id: str):
+        node = self.nodes.get(note_id)
         if node:
             self.centerOn(node)
 
-    def highlight(self, current_title: str):
+    def highlight(self, current_id: str):
         if not self.nodes:
             return
 
         neighbors = set()
         for a, b in self.edges:
-            if a == current_title:
+            if a == current_id:
                 neighbors.add(b)
-            if b == current_title:
+            if b == current_id:
                 neighbors.add(a)
 
         # сброс ребер
@@ -232,18 +230,18 @@ class GraphView(QGraphicsView):
         pen_edge_hi = self._pen_edge_hi
         pen_edge_hi.setWidth(2)
         for nb in neighbors:
-            line = self.edge_items.get((current_title, nb)) or self.edge_items.get((nb, current_title))
+            line = self.edge_items.get((current_id, nb)) or self.edge_items.get((nb, current_id))
             if line:
                 line.setPen(pen_edge_hi)
 
         # узлы
-        for title, node in self.nodes.items():
+        for nid, node in self.nodes.items():
             node.setSelected(False)  # чтобы hover/leave корректно возвращал стиль
-            if title == current_title:
+            if nid == current_id:
                 node.setPen(node.pen_selected)
                 node.setBrush(node.brush_selected)
                 node.glow.setVisible(True)
-            elif title in neighbors:
+            elif nid in neighbors:
                 node.setPen(node.pen_hover)
                 node.setBrush(node.brush_hover)
                 node.glow.setVisible(False)
@@ -266,25 +264,26 @@ class GraphView(QGraphicsView):
                 cur = cur.parentItem()
 
             if node is not None:
-                self.on_open_note(node.title)
+                self.on_open_note(node.note_id)
                 return
         super().mousePressEvent(event)
 
     def build(self, nodes: list[str], edges: list[tuple[str, str]]):
-        prev_pos = {t: node.pos() for t, node in self.nodes.items()}
+        # nodes: list[note_id]
+        prev_pos = {nid: node.pos() for nid, node in self.nodes.items()}
         self.scene.clear()
         self.nodes.clear()
         self.edges = edges[:]
         self.edge_items.clear()
 
         # степень узлов
-        deg = {n: 0 for n in nodes}
+        deg = {nid: 0 for nid in nodes}
         for a, b in edges:
             if a in deg: deg[a] += 1
             if b in deg: deg[b] += 1
 
         rng = random.Random(42)
-        pos = {n: QPointF(rng.uniform(-250, 250), rng.uniform(-250, 250)) for n in nodes}
+        pos = {nid: QPointF(rng.uniform(-250, 250), rng.uniform(-250, 250)) for nid in nodes}
         # steps may be injected from background worker stats, but GraphView is UI-only.
         # We'll choose a safe default; caller may override by setting self._layout_steps.
         steps = getattr(self, "_layout_steps", 250)
@@ -298,14 +297,14 @@ class GraphView(QGraphicsView):
         pen_edge = self._pen_edge
 
         # узлы (создаем на "старых" позициях, если узел существовал)
-        for n in nodes:
-            tp = target_pos[n]
-            sp = prev_pos.get(n, tp)  # старт = старая позиция, если есть
-
-            node = GraphNode(n, sp.x(), sp.y(), degree=deg.get(n, 0), theme=self._t, r_base=10.0)
+        for nid in nodes:
+            tp = target_pos[nid]
+            sp = prev_pos.get(nid, tp)  # старт = старая позиция, если есть
+            # label пока = note_id (UI-слой может позже заменить на title)
+            node = GraphNode(nid, nid, sp.x(), sp.y(), degree=deg.get(nid, 0), theme=self._t, r_base=10.0)
             node.setZValue(10)
             self.scene.addItem(node)
-            self.nodes[n] = node
+            self.nodes[nid] = node
 
         for a, b in edges:
             na = self.nodes.get(a)
