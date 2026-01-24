@@ -119,12 +119,10 @@ class RenameRewriteController:
             log.exception("Failed to rebuild link index after rename rewrite")
 
         app.refresh_list()
-        # Re-select current note by title
+        # Re-select current note by note_id (titles may collide)
         try:
             if app.current_note_id:
-                info = app._catalog.get(app.current_note_id)
-                if info:
-                    app._select_in_list(info.title)
+                app._select_in_list_by_id(app.current_note_id)
         except Exception:
             pass
         app.request_build_link_graph(immediate=True)

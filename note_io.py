@@ -13,6 +13,16 @@ _NOTE_ID_RE = re.compile(r"(?m)^\s*note_id\s*:\s*(.+?)\s*$")
 _TITLE_RE = re.compile(r"(?m)^\s*title\s*:\s*(.+?)\s*$")
 _H1_RE = re.compile(r"(?m)^\s*#\s+(.+?)\s*$")
 
+def _build_frontmatter(*, title: str, note_id: str) -> str:
+    title = (title or "").strip() or "Untitled"
+    note_id = (note_id or "").strip() or generate_note_id()
+    return (
+        "---\n"
+        f"note_id: {note_id}\n"
+        f"title: {title}\n"
+        "---\n\n"
+    )
+
 def set_note_title_in_text(text: str, *, new_title: str) -> tuple[str, bool]:
     """
     Best-effort update:
@@ -41,10 +51,16 @@ def set_note_title_in_text(text: str, *, new_title: str) -> tuple[str, bool]:
             out = _FM_RE.sub(lambda _: f"---\n{fm2}\n---\n", out, count=1)
             changed = True
     else:
-        # no frontmatter: prepend
+        # no frontmatter:
+        #  - if H1 exists: add ONLY frontmatter, then rewrite that H1
+        #  - if no H1: add frontmatter + H1 skeleton
         nid, _ = parse_note_meta(out)
         nid2 = nid or generate_note_id()
-        out = build_new_note_text(title=new_title, note_id=nid2) + out
+        fm = _build_frontmatter(title=new_title, note_id=nid2)
+        if _H1_RE.search(out):
+            out = fm + out
+        else:
+            out = fm + f"# {new_title}\n\n" + out
         changed = True
 
     # Update first H1 if present (optional but nice)
@@ -56,7 +72,6 @@ def set_note_title_in_text(text: str, *, new_title: str) -> tuple[str, bool]:
             changed = True
 
     return out, changed
-
 
 def generate_note_id() -> str:
     # короткий, но достаточно уникальный для vault; при желании можно UUID целиком
@@ -95,13 +110,7 @@ def parse_note_meta(text: str) -> tuple[str | None, str | None]:
 def build_new_note_text(*, title: str, note_id: str) -> str:
     title = (title or "").strip() or "Untitled"
     note_id = (note_id or "").strip() or generate_note_id()
-    return (
-        "---\n"
-        f"note_id: {note_id}\n"
-        f"title: {title}\n"
-        "---\n\n"
-        f"# {title}\n\n"
-    )
+    return _build_frontmatter(title=title, note_id=note_id) + f"# {title}\n\n"
 
 
 def ensure_note_has_id(path: Path) -> str:

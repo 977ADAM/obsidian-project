@@ -71,14 +71,6 @@ def setup_logging() -> SessionAdapter:
 
     logger.info("Logging initialized. log_file=%s", LOG_PATH)
 
-    # Extra helper for autosave diagnostics
-    def log_autosave_skip():
-        logger.info(
-            "Autosave skipped: note token mismatch (note switched before timer fired)"
-        )
-
-    logger.log_autosave_skip = log_autosave_skip  # type: ignore
-
     return SessionAdapter(logger, {})
 
 

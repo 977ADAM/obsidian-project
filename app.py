@@ -89,7 +89,7 @@ class NotesApp(QMainWindow):
 
         # ---- NAVIGATION ----
         # ВАЖНО: callback не должен снова писать в историю, иначе рекурсия.
-        self._nav = NavigationController(lambda nid: (self._open_by_id_no_history(nid) or True))
+        self._nav = NavigationController(lambda nid: self._open_by_id_no_history(nid))
 
         self._dirty = False
         self._pending_save_token: str = self._note_token
@@ -118,7 +118,7 @@ class NotesApp(QMainWindow):
         left_layout.addWidget(self.search)
         left_layout.addWidget(self.listw)
         left_layout.addWidget(self.backlinks)
-        self.backlinks.itemClicked.connect(lambda it: self.open_or_create_by_title(it.text()))
+        self.backlinks.itemClicked.connect(self._on_backlink_clicked)
 
         self.right_splitter = QSplitter(Qt.Vertical)
         self.right_splitter.addWidget(self.editor)
@@ -238,7 +238,7 @@ class NotesApp(QMainWindow):
         self._last_saved_text = text
 
         self._render_preview(text)
-        self._select_in_list(title)
+        self._select_in_list_by_id(note_id)
 
         self.request_build_link_graph(immediate=True)
         self.graph.highlight(note_id)
@@ -616,20 +616,20 @@ class NotesApp(QMainWindow):
         # 2) Fallback: treat as title
         return self.open_or_create_by_title(ref)
 
-    def _open_by_id_no_history(self, note_id: str) -> None:
+    def _open_by_id_no_history(self, note_id: str) -> bool:
         """Открыть заметку, НЕ трогая историю навигации (используется NavigationController)."""
         info = self._catalog.get(note_id)
         if not info:
-            return
+            return False
         self._switch_to_note(note_id=note_id, path=info.path, title=info.title)
+        return True
 
     def open_by_id(self, note_id: str) -> None:
         """Публичное открытие: открываем и коммитим в историю."""
-        self._open_by_id_no_history(note_id)
         try:
             self._nav.open(note_id, reopen_current=False)
         except Exception:
-            pass
+            return
 
     def create_and_open(self, title: str) -> None:
         assert self.vault_dir is not None
@@ -649,26 +649,39 @@ class NotesApp(QMainWindow):
     def nav_forward(self):
         self._nav.forward()
 
-    def _select_in_list(self, title: str):
-        # Важно: setCurrentRow триггерит itemSelectionChanged -> _on_select_note -> open_or_create...
-        # Поэтому на время выделения блокируем сигналы списка.
+    def _select_in_list_by_id(self, note_id: str) -> None:
+        note_id = (note_id or "").strip()
+        if not note_id:
+            return
+
         def find_row() -> int:
             for i in range(self.listw.count()):
-                if self.listw.item(i).text() == title:
-                    return i
+                it = self.listw.item(i)
+                try:
+                    if str(it.data(Qt.UserRole)) == note_id:
+                        return i
+                except Exception:
+                    pass
             return -1
 
+        # Важно: setCurrentRow триггерит itemSelectionChanged -> _on_select_note -> open_by_id
+        # Поэтому на время выделения блокируем сигналы списка.
         with blocked_signals(self.listw):
             row = find_row()
             if row >= 0:
                 self.listw.setCurrentRow(row)
                 return
-
-            # если не было — обновим список и попробуем ещё раз
             self.refresh_list()
             row = find_row()
             if row >= 0:
                 self.listw.setCurrentRow(row)
+
+    def _on_backlink_clicked(self, it: QListWidgetItem) -> None:
+        nid = it.data(Qt.UserRole)
+        if nid:
+            self.open_by_id(str(nid))
+            return
+        self.open_or_create_by_title(it.text())
 
     def _on_text_changed(self):
         self._dirty = True
@@ -782,9 +795,7 @@ class NotesApp(QMainWindow):
             return False
 
         if check_token and getattr(self, "_pending_save_token", None) != self._note_token:
-            log.debug("Save skipped: note switched before timer fired")
-            if hasattr(log, "log_autosave_skip"):
-                log.log_autosave_skip()
+            log.info("Autosave skipped: note token mismatch (note switched before timer fired)")
             return False
 
         text = self.editor.toPlainText()
@@ -880,7 +891,9 @@ class NotesApp(QMainWindow):
         for src_id in refs:
             info = self._catalog.get(src_id)
             if info:
-                self.backlinks.addItem(info.title)
+                it = QListWidgetItem(info.title)
+                it.setData(Qt.UserRole, src_id)
+                self.backlinks.addItem(it)
 
     def create_note_dialog(self):
         # простой способ: используем строку поиска как ввод имени
