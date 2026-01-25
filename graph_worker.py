@@ -74,7 +74,7 @@ class _GraphBuildWorker(QRunnable):
             # LOCAL graph selection (if requested and we have a center)
             nodes = nodes_all
             edges = edges_all
-            if self.mode == "local" and self.center:
+            if self.mode == "local" and self.center and self.center in nodes_all:
                 adj: dict[str, set[str]] = {n: set() for n in nodes_all}
                 for a, b in edges_all:
                     if a in adj:

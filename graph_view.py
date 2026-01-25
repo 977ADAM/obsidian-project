@@ -148,6 +148,17 @@ class GraphView(QGraphicsView):
         self._lod_current = 1.0
         self._lod_target = 1.0
 
+
+    def clear_graph(self) -> None:
+        """Сброс сцены/кэшей графа (например, при смене vault)."""
+        try:
+            self._scene.clear()
+        except Exception:
+            pass
+        self.nodes.clear()
+        self.edges = []
+        self.edge_items.clear()
+
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else (1 / 1.15)
 

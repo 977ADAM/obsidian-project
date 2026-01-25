@@ -16,9 +16,11 @@ class LinkIndex:
     `dst` may be virtual (note does not exist yet).
     """
 
-    # note_id-based graph
-    outgoing: dict[str, set[str]] = field(default_factory=dict)  # src_id -> {dst_id}
-    incoming: dict[str, set[str]] = field(default_factory=dict)  # dst_id -> {src_id}
+    # note_ref-based graph:
+    #   - src is always note_id
+    #   - dst can be note_id (resolved) OR a virtual title_key (unresolved)
+    outgoing: dict[str, set[str]] = field(default_factory=dict)  # src_id -> {dst_ref}
+    incoming: dict[str, set[str]] = field(default_factory=dict)  # dst_ref -> {src_id}
 
     # ───────────────────────── public API ─────────────────────────
 
@@ -65,13 +67,17 @@ class LinkIndex:
         if not src_id:
             return False
 
-        # wikilinks are titles; resolve to note_id (skip unresolved targets)
+        # wikilinks are titles; resolve to note_id; keep unresolved as virtual nodes
         new_targets_title = extract_wikilink_targets(markdown_text)
         new_targets: set[str] = set()
         for t in new_targets_title:
             dst_id = resolve_title_to_id(t)
             if dst_id and dst_id != src_id:
                 new_targets.add(dst_id)
+            elif not dst_id:
+                # keep virtual node (canonical title_key)
+                if t and t != src_id:
+                    new_targets.add(t)
 
         old_targets = self.outgoing.get(src_id, set())
 

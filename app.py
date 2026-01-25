@@ -2,6 +2,7 @@ import uuid
 import logging
 from pathlib import Path
 import time
+from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, QThreadPool, QSettings
 from PySide6.QtGui import QAction
@@ -109,7 +110,8 @@ class NotesApp(QMainWindow):
         self.editor = QTextEdit()
         self.preview = LinkableWebView()
 
-        self.graph = GraphView(self.open_or_create_by_title)
+        # GraphView передаёт note_id при клике по узлу
+        self.graph = GraphView(self.open_note_ref)
 
         self.splitter = QSplitter(Qt.Horizontal)
         left = QWidget()
@@ -364,12 +366,26 @@ class NotesApp(QMainWindow):
         if save:
             safe_set_setting(self._settings, SettingsKeys.VAULT_DIR, str(self.vault_dir))
 
-        self.current_path = None
+        self.current_note_id = None
+        # reset token to avoid any delayed autosave thinking it's the previous note
+        self._note_token = uuid.uuid4().hex
+        self._pending_save_token = self._note_token
         with blocked_signals(self.editor):
             self.editor.clear()
         self._dirty = False
         self._last_saved_text = ""
         self._nav.clear()
+
+        # clear stale preview/graph from previous vault
+        self._last_preview_source_text = None
+        try:
+            self.preview.setHtml("")
+        except Exception:
+            pass
+        try:
+            self.graph.clear_graph()
+        except Exception:
+            pass
 
         self._rebuild_catalog()
         self._rebuild_link_index()
@@ -496,16 +512,6 @@ class NotesApp(QMainWindow):
 
         dlg = QuickSwitcherDialog(self, get_titles=get_titles, on_open=self.open_or_create_by_title)
         dlg.exec()
-
-    def _open_note_no_history(self, title: str):
-        """Открывает/создаёт заметку и обновляет UI, но НЕ трогает историю."""
-        if self.vault_dir is None:
-            return
-        nid = self._catalog.resolve_title(title)
-        if nid:
-            self.open_by_id(nid)
-            return
-        self.create_and_open(title)
 
     def choose_vault(self):
         log.info("Открылось диалоговое окно «Выбрать хранилище».")
@@ -641,6 +647,11 @@ class NotesApp(QMainWindow):
             atomic_write_text(path, build_new_note_text(title=title, note_id=nid), encoding="utf-8")
         # обновим каталог (точечно)
         self._catalog.rebuild(self.vault_dir, migrate_to_id_paths=True)
+        # важно: чтобы backlinks/graph сразу “увидели” новую заметку
+        try:
+            self._rebuild_link_index()
+        except Exception:
+            pass
         self.open_by_id(nid)
 
     def nav_back(self):

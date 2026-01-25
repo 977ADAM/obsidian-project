@@ -57,3 +57,7 @@ def sanitize_rendered_html(rendered_html: str) -> str:
     )
     # Also strip out any JS-able URLs that might slip through.
     return cleaned
+
+def sanitizer_available() -> bool:
+    """True если bleach установлен и sanitization HTML доступен."""
+    return bleach is not None

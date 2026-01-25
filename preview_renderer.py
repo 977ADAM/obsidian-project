@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import html
 import markdown as md
 
 from typing import Callable, Optional
 from wikilinks import wikilinks_to_html
-from html_sanitizer import sanitize_rendered_html
+from html_sanitizer import sanitize_rendered_html, sanitizer_available
 
 
 MD_EXTENSIONS = ["fenced_code", "tables", "toc"]
@@ -29,6 +30,9 @@ def render_markdown_to_safe_html(
       2) markdown -> HTML
       3) sanitize HTML
     """
+    if not sanitizer_available():
+        return "<pre>" + html.escape(note_text or "") + "</pre>"
+
     text2 = wikilinks_to_html(note_text, resolve_title_to_id=resolve_title_to_id)
     rendered = md.markdown(text2, extensions=MD_EXTENSIONS)
     return sanitize_rendered_html(rendered)
