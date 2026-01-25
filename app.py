@@ -67,6 +67,15 @@ class NotesApp(QMainWindow):
         self.graph_mode = get_str(self._settings, SettingsKeys.GRAPH_MODE, "global")
         self.graph_depth = get_int(self._settings, SettingsKeys.GRAPH_DEPTH, 1)
 
+        # persisted options (view)
+        self._view_mode = get_str(self._settings, SettingsKeys.UI_VIEW_MODE, "edit")
+        self._preview_in_edit = bool(get_int(self._settings, SettingsKeys.UI_PREVIEW_IN_EDIT, 1))
+
+        # runtime UI flags
+        self._ui_busy: bool = False
+        # Remember last "good" edit-layout splitter sizes so Read mode doesn't destroy them.
+        self._right_sizes_edit: list[int] | None = None
+
         # --- GRAPH LIMITS / PERF (persisted) ---
         self.max_graph_nodes = get_int(self._settings, SettingsKeys.GRAPH_MAX_NODES, 400)
         self.max_graph_steps = get_int(self._settings, SettingsKeys.GRAPH_MAX_STEPS, 250)
@@ -108,6 +117,9 @@ class NotesApp(QMainWindow):
         self.backlinks.setToolTip("Backlinks: кто ссылается на текущую заметку")
 
         self.editor = QTextEdit()
+        # Пока не открыта заметка — запрещаем редактирование,
+        # чтобы не ловить "изменения без файла" и автосейв в неверный путь.
+        self.editor.setReadOnly(True)
         self.preview = LinkableWebView()
 
         # GraphView передаёт note_id при клике по узлу
@@ -186,6 +198,9 @@ class NotesApp(QMainWindow):
         self._apply_theme(self._theme, save=False)
         self._apply_graph_mode(self.graph_mode, self.graph_depth, save=False)
 
+        # Apply persisted Edit/Read mode after actions exist.
+        self._apply_view_mode(self._view_mode, save=False)
+
         # Start: try reopen last vault/note (fallback to picker).
         self._startup_open()
 
@@ -225,6 +240,12 @@ class NotesApp(QMainWindow):
         self.current_path = path
         self.current_note_id = note_id
         self._note_token = uuid.uuid4().hex
+        # Заметка открыта — можно редактировать, но учитываем текущий режим (Edit/Read)
+        # и возможный "busy"-режим фоновых операций.
+        try:
+            self.editor.setReadOnly(self._ui_busy or self._view_mode == "read")
+        except Exception:
+            pass
 
         # persist last opened note
         # Persist last opened note as note_id (preferred).
@@ -251,12 +272,13 @@ class NotesApp(QMainWindow):
         """
         Минимальная блокировка UI на время тяжёлых фоновых операций (mass rewrite).
         """
+        self._ui_busy = bool(busy)
         try:
             self.search.setEnabled(not busy)
             self.listw.setEnabled(not busy)
             self.backlinks.setEnabled(not busy)
             # на время переписывания лучше запретить правку, чтобы не получить гонки
-            self.editor.setReadOnly(busy)
+            self.editor.setReadOnly(self._ui_busy or self.current_path is None or self._view_mode == "read")
             # меню оставляем, но можно расширить при желании
         except Exception:
             log.exception("Failed to toggle UI busy state (busy=%s)", busy)
@@ -335,6 +357,142 @@ class NotesApp(QMainWindow):
             safe_set_setting(self._settings, SettingsKeys.GRAPH_MODE, self.graph_mode)
             safe_set_setting(self._settings, SettingsKeys.GRAPH_DEPTH, self.graph_depth)
 
+    # --- Edit / Read mode (preview-only) ---
+    def _normalize_view_mode(self, mode: str) -> str:
+        m = (mode or "").strip().lower()
+        return "read" if m in ("read", "readonly", "preview") else "edit"
+
+    def _set_view_mode(self, mode: str, *, save: bool = True) -> None:
+        """Публичный переключатель режима. Вход в Read mode делает best-effort flush."""
+        mode_norm = self._normalize_view_mode(mode)
+        if mode_norm == "read" and getattr(self, "_view_mode", "edit") != "read":
+            # Скрывая редактор, лучше гарантированно сбросить дебаунсы и сохранить текущий текст.
+            self._stop_timers_and_flush(reason="enter_read_mode")
+        self._apply_view_mode(mode_norm, save=save)
+
+    def _apply_view_mode(self, mode: str, *, save: bool = True) -> None:
+        """
+        Read mode: показываем только preview (editor+graph скрыты, editor readonly).
+        Edit mode: editor + (опционально) preview + graph.
+        """
+        mode_norm = self._normalize_view_mode(mode)
+        self._view_mode = mode_norm
+
+        # sync menu state if actions exist
+        if hasattr(self, "_act_read_mode") and self._act_read_mode is not None:
+            self._sync_action_checks({self._act_read_mode: self._view_mode == "read"})
+
+        # In Read mode preview is always shown -> disable the "preview in edit" toggle
+        if hasattr(self, "_act_preview_in_edit") and self._act_preview_in_edit is not None:
+            try:
+                self._act_preview_in_edit.setEnabled(self._view_mode != "read")
+            except Exception:
+                pass
+
+        if self._view_mode == "read":
+            # Remember current edit splitter sizes (best-effort) so we can restore later.
+            try:
+                if self._right_sizes_edit is None and not self.editor.isHidden():
+                    self._right_sizes_edit = list(self.right_splitter.sizes())
+            except Exception:
+                pass
+
+            # show only preview
+            try:
+                self.editor.setReadOnly(True)
+                self.editor.setVisible(False)
+            except Exception:
+                pass
+            try:
+                self.graph.setVisible(False)
+            except Exception:
+                pass
+            try:
+                self.preview.setVisible(True)
+            except Exception:
+                pass
+
+            # make preview fill the splitter
+            try:
+                self.right_splitter.setSizes([0, 1, 0])
+            except Exception:
+                pass
+
+            # ensure preview is up-to-date
+            try:
+                self._render_preview_from_editor()
+            except Exception:
+                pass
+
+            try:
+                self.preview.setFocus()
+            except Exception:
+                pass
+
+        else:  # edit
+            try:
+                self.editor.setVisible(True)
+            except Exception:
+                pass
+            try:
+                self.graph.setVisible(True)
+            except Exception:
+                pass
+            try:
+                self.preview.setVisible(bool(self._preview_in_edit))
+            except Exception:
+                pass
+
+            # editable only when a note is open and we are not busy
+            try:
+                self.editor.setReadOnly(self._ui_busy or self.current_path is None)
+            except Exception:
+                pass
+
+            # restore splitter sizes if we have them
+            try:
+                if self._right_sizes_edit:
+                    self.right_splitter.setSizes(self._right_sizes_edit)
+            except Exception:
+                pass
+
+            # if preview is visible now, render current text (might have been skipped while hidden)
+            try:
+                if not self.preview.isHidden():
+                    self._render_preview_from_editor()
+            except Exception:
+                pass
+
+            try:
+                self.editor.setFocus()
+            except Exception:
+                pass
+
+        if save:
+            safe_set_setting(self._settings, SettingsKeys.UI_VIEW_MODE, self._view_mode)
+
+    def _apply_preview_in_edit(self, enabled: bool, *, save: bool = True) -> None:
+        """Опционально скрывать превью в Edit mode (в Read mode игнорируется)."""
+        self._preview_in_edit = bool(enabled)
+
+        if hasattr(self, "_act_preview_in_edit") and self._act_preview_in_edit is not None:
+            self._sync_action_checks({self._act_preview_in_edit: self._preview_in_edit})
+
+        if getattr(self, "_view_mode", "edit") == "edit":
+            try:
+                self.preview.setVisible(self._preview_in_edit)
+            except Exception:
+                pass
+            if self._preview_in_edit:
+                # render immediately so user sees fresh preview
+                try:
+                    self._render_preview_from_editor()
+                except Exception:
+                    pass
+
+        if save:
+            safe_set_setting(self._settings, SettingsKeys.UI_PREVIEW_IN_EDIT, 1 if self._preview_in_edit else 0)
+
     def _startup_open(self) -> None:
         # try reopen vault
         vault_path = Path(self._startup_vault_dir) if self._startup_vault_dir else None
@@ -366,12 +524,18 @@ class NotesApp(QMainWindow):
         if save:
             safe_set_setting(self._settings, SettingsKeys.VAULT_DIR, str(self.vault_dir))
 
+        # Важно: сбрасываем и note_id, и path — иначе автосейв может писать в старый файл.
         self.current_note_id = None
+        self.current_path = None
         # reset token to avoid any delayed autosave thinking it's the previous note
         self._note_token = uuid.uuid4().hex
         self._pending_save_token = self._note_token
         with blocked_signals(self.editor):
             self.editor.clear()
+        try:
+            self.editor.setReadOnly(True)
+        except Exception:
+            pass
         self._dirty = False
         self._last_saved_text = ""
         self._nav.clear()
@@ -384,6 +548,13 @@ class NotesApp(QMainWindow):
             pass
         try:
             self.graph.clear_graph()
+        except Exception:
+            pass
+
+        # очищаем хвосты UI от предыдущего vault
+        try:
+            with blocked_signals(self.backlinks):
+                self.backlinks.clear()
         except Exception:
             pass
 
@@ -483,6 +654,27 @@ class NotesApp(QMainWindow):
 
         viewm.addAction(self._act_dark)
         viewm.addAction(self._act_light)
+
+        viewm.addSeparator()
+
+        # --- Edit / Read mode ---
+        self._act_read_mode = QAction("Read mode (preview only)", self, checkable=True)
+        self._act_read_mode.setShortcut("F6")
+        self._act_read_mode.setChecked(self._view_mode == "read")
+        self._act_read_mode.triggered.connect(
+            lambda checked: self._set_view_mode("read" if checked else "edit", save=True)
+        )
+        viewm.addAction(self._act_read_mode)
+
+        # --- Preview visibility inside Edit mode (optional) ---
+        self._act_preview_in_edit = QAction("Показывать превью в Edit", self, checkable=True)
+        self._act_preview_in_edit.setChecked(bool(self._preview_in_edit))
+        self._act_preview_in_edit.triggered.connect(
+            lambda checked: self._apply_preview_in_edit(bool(checked), save=True)
+        )
+        # В Read mode превью всегда показано → действие выключаем
+        self._act_preview_in_edit.setEnabled(self._view_mode != "read")
+        viewm.addAction(self._act_preview_in_edit)
 
         graphm = menubar.addMenu("Граф")
 
@@ -695,6 +887,10 @@ class NotesApp(QMainWindow):
         self.open_or_create_by_title(it.text())
 
     def _on_text_changed(self):
+        # В Read mode изменения текста происходить не должны (редактор скрыт/readonly),
+        # но на всякий случай гасим лишние таймеры/перерисовки.
+        if getattr(self, "_view_mode", "edit") == "read":
+            return
         self._dirty = True
         # remember which note the pending autosave belongs to
         self._pending_save_token = self._note_token
@@ -712,7 +908,18 @@ class NotesApp(QMainWindow):
         if getattr(self, "_last_preview_source_text", None) == text:
             return
         self._last_preview_source_text = text
-        self.preview.setHtml(render_preview_page(text, resolve_title_to_id=self._catalog.resolve_title))
+        # Если превью скрыто (например, в Edit mode пользователь выключил), не тратим CPU на QWebEngine.
+        # При повторном показе превью мы дорендерим текущий текст.
+        try:
+            if self.preview.isHidden():
+                return
+        except Exception:
+            pass
+
+        try:
+            self.preview.setHtml(render_preview_page(text, resolve_title_to_id=self._catalog.resolve_title))
+        except Exception:
+            log.exception("Failed to render preview")
 
     def rename_current_note_dialog(self):
         """

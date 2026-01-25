@@ -19,6 +19,8 @@ class SettingsKeys:
     GRAPH_DEPTH: str = "graph/depth"
     GRAPH_MAX_NODES: str = "graph/max_nodes"
     GRAPH_MAX_STEPS: str = "graph/max_steps"
+    UI_VIEW_MODE: str = "ui/view_mode"              # "edit" | "read"
+    UI_PREVIEW_IN_EDIT: str = "ui/preview_in_edit"  # 1/0
 
 
 def get_str(settings: QSettings, key: str, default: str) -> str:
